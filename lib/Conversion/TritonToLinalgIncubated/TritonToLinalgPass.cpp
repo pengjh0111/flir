@@ -477,6 +477,30 @@ void TritonToLinalgIncubatedPass::addDynamicLegal(
     return tritonTypeConverter.isSignatureLegal(op.getFunctionType());
   });
 
+  // Check the call's own types to avoid symbol rewrite-order dependence.
+  target.addDynamicallyLegalOp<triton::CallOp>([&](triton::CallOp op) {
+    return llvm::all_of(op->getOperandTypes(),
+                        [&](Type t) { return tritonTypeConverter.isLegal(t); }) &&
+           llvm::all_of(op->getResultTypes(),
+                        [&](Type t) { return tritonTypeConverter.isLegal(t); });
+  });
+
+  // Non-void returns must match the converted function result types.
+  target.addDynamicallyLegalOp<triton::ReturnOp>([&](triton::ReturnOp op) {
+    auto func = op->getParentOfType<triton::FuncOp>();
+    SmallVector<Type> targetResultTypes;
+    if (failed(tritonTypeConverter.convertTypes(
+            func.getFunctionType().getResults(), targetResultTypes)) ||
+        targetResultTypes.size() != op.getSrcs().size())
+      return false;
+    for (auto [operandTy, targetTy] :
+        llvm::zip(op.getSrcs().getTypes(), targetResultTypes)) {
+      if (operandTy != targetTy)
+        return false;
+    }
+    return true;
+  });
+
   // For CustomOp, tt.ptr should be converted to memref.
   target.addDynamicallyLegalOp<hivm::CustomOp>([&](hivm::CustomOp op) {
     return all_of(op->getOperandTypes(), [](Type t) {
@@ -626,6 +650,10 @@ void TritonToLinalgIncubatedPass::populateTritonToLinalgConversionPatterns(
   patterns.add<FunctionConverter::GetProgramIDConverter>(patterns.getContext());
   patterns.add<FunctionConverter::GetNumProgramsConverter>(
       patterns.getContext());
+  patterns.add<FunctionConverter::CallOpConverter>(typeConverter,
+                                                   patterns.getContext());
+  patterns.add<FunctionConverter::ReturnOpConverter>(typeConverter,
+                                                     patterns.getContext());
   patterns.add<LoadStoreConverter::LoadConverter>(patterns.getContext());
   patterns.add<LoadStoreConverter::AtomicRMWConverter>(patterns.getContext());
   patterns.add<LoadStoreConverter::AtomicCASConverter>(patterns.getContext());
@@ -930,10 +958,10 @@ void TritonToLinalgIncubatedPass::runOnOperation() {
                                                    patterns);
 #endif
 
-  // 6. Inject program id / number of programs arguments into each Triton kernel
-  // function.
+  // 6. Inject program information only into runtime entry kernels.
   for (auto func : getOperation().getOps<triton::FuncOp>()) {
-    addProgramInfo(func, globalKernel);
+    if (func.isPublic())
+      addProgramInfo(func, globalKernel);
   }
 
   moduleOp.walk([this](LoopLikeOpInterface loopOp) {
