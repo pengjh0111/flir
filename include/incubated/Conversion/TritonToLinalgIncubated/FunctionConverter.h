@@ -56,5 +56,23 @@ public:
   matchAndRewrite(triton::GetNumProgramsOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
+
+// Reconcile call operands and results with the converted callee signature.
+class CallOpConverter : public OpConversionPattern<triton::CallOp> {
+public:
+  using OpConversionPattern<triton::CallOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(triton::CallOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+// Reconcile return operands with the converted function result types.
+class ReturnOpConverter : public OpConversionPattern<triton::ReturnOp> {
+public:
+  using OpConversionPattern<triton::ReturnOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(triton::ReturnOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
 } // namespace FunctionConverter
 #endif
