@@ -167,3 +167,11 @@ LogicalResult WaitFlagOp::verify() {
 LogicalResult PipeBarrierOp::verify() {
   return success();
 }
+
+//===----------------------------------------------------------------------===//
+// ConcatOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ConcatOp::verify() {
+  return success();
+}

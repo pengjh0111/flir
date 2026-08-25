@@ -419,6 +419,47 @@ def CommonIR_CastOp : CommonIR_Op<"cast", [Pure]> {
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 }
 
+// ---------------------------------------------------------------------------
+// tile.concat — Concatenate tensors along a dimension
+// ---------------------------------------------------------------------------
+def CommonIR_ConcatOp : CommonIR_Op<"concat", [Pure]> {
+  let summary = "Concatenate two tensors along a specified dimension";
+  let description = [{
+    Concatenates two tensors along the specified dimension. Used in sinkhorn
+    optimization to combine small vectors into larger ones for better SIMD
+    utilization on Ascend Vector Core.
+
+    Operates on standard tensor types (for compute), not !tile.buf (for memory).
+
+    This operation lowers differently based on tensor dimensionality:
+    - 1D tensors: lowers to tensor.insert_slice sequence in Linalg IR
+    - 2D tensors: lowers to tensor.concat in Linalg IR
+
+    Both paths eventually lower to hivm.hir.vconcat in HIVM IR.
+
+    Example:
+    ```mlir
+    // 1D: <128> + <128> -> <256>
+    %z = tile.concat %x, %y {dim = 0}
+           : tensor<128xf32>, tensor<128xf32> -> tensor<256xf32>
+
+    // 2D: <1x128> + <1x128> -> <2x128>
+    %z = tile.concat %x, %y {dim = 0}
+           : tensor<1x128xf32>, tensor<1x128xf32> -> tensor<2x128xf32>
+    ```
+  }];
+
+  let arguments = (ins
+    TT_Tensor:$lhs,
+    TT_Tensor:$rhs,
+    I64Attr:$dim
+  );
+
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)";
+}
+
 //===----------------------------------------------------------------------===//
 // Tensor Conversion Operations
 //===----------------------------------------------------------------------===//
