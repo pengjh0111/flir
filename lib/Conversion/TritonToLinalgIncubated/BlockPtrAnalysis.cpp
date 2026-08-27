@@ -51,6 +51,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -1350,8 +1351,14 @@ void BlockDataParser::rewriteCustomOp(
     resultTypes.emplace_back(ty);
   }
   auto newCustomOp =
+#if LLVM_VERSION_MAJOR >= 22
       rewriter.create<hivm::CustomOp>(loc, resultTypes, op.getName(), newInputs,
                                       newOutputs, adaptor.getTempBuffers());
+#else
+      rewriter.create<hivm::CustomOp>(loc, resultTypes,
+                                      rewriter.getStringAttr(op.getName()),
+                                      newInputs, newOutputs);
+#endif
   auto operandSegmentSizesAttr = newCustomOp->getAttr("operandSegmentSizes");
   newCustomOp->setAttrs(op->getAttrs());
   newCustomOp->setAttr("operandSegmentSizes", operandSegmentSizesAttr);

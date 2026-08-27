@@ -336,8 +336,12 @@ LogicalResult triton::Incubated::runUseAnalysis(triton::FuncOp &funcOp) {
       }
       if (!isa<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp,
                triton::ReduceOp>(op)) {
-        assert(op->getNumResults() == 1 &&
-               "Ops used for meta computation are expected to have one result");
+        // Side-effect-only ops (e.g. memref.copy) have 0 results and cannot
+        // be tagged for meta computation; treat them as no-ops for analysis.
+        if (op->getNumResults() == 0)
+          return;
+        // Multi-result ops (e.g. tt.call returning (i32, i32) for swizzle)
+        // are allowed; the per-result loop below will only tag shaped results.
       }
       for (auto it = 0; it < op->getNumResults(); ++it) {
         // Only set the tag if the operation uses tensors
