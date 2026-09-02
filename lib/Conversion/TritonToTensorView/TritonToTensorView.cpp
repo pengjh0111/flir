@@ -52,6 +52,23 @@ static Type getPtrPointeeType(Type t) {
   return Type();
 }
 
+/// True for a regular, arange-based tile offset (`make_range`, or
+/// `origin + make_range`) -- a dense access that belongs on the native path,
+/// not the discrete pointer fallback.
+static bool isRegularAffineIndex(Value idxTensor) {
+  if (idxTensor.getDefiningOp<triton::MakeRangeOp>())
+    return true;
+  auto addi = idxTensor.getDefiningOp<arith::AddIOp>();
+  if (!addi)
+    return false;
+  bool hasRange = false, hasOrigin = false;
+  for (Value op : {addi.getLhs(), addi.getRhs()}) {
+    hasRange |= bool(op.getDefiningOp<triton::MakeRangeOp>());
+    hasOrigin |= bool(op.getDefiningOp<triton::SplatOp>());
+  }
+  return hasRange && hasOrigin;
+}
+
 /// Match the rank-1 discrete pointer fallback, folding hoisted scalar offsets
 /// into the index tensor.
 static bool matchPtrAccess(OpBuilder &b, Location loc, Value ptrTensor,
@@ -62,8 +79,10 @@ static bool matchPtrAccess(OpBuilder &b, Location loc, Value ptrTensor,
   auto splat = addptr.getPtr().getDefiningOp<triton::SplatOp>();
   if (!splat)
     return false;
-  // Discrete offsets must be ranked tensors.
+  // Discrete offsets must be ranked tensors, and not a regular tile access.
   if (!isa<RankedTensorType>(addptr.getOffset().getType()))
+    return false;
+  if (isRegularAffineIndex(addptr.getOffset()))
     return false;
 
   Value scalarPtr = splat.getSrc();
