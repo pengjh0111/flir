@@ -52,7 +52,7 @@ namespace {
 //===----------------------------------------------------------------------===//
 
 /// Information recovered from an encoded view chain.
-struct ViewInfo {
+struct ViewData {
   Value base;                        // flat memref<?xT> (plain, no address space)
   Type elementType;
   unsigned rank = 0;
@@ -67,31 +67,21 @@ struct ViewInfo {
   bool isGatherScatter() const { return !sparseDims.empty(); }
 };
 
-static ViewInfo traceView(Value viewVal) {
-  ViewInfo vi;
+static ViewData parseView(Value viewVal) {
+  ViewData vi;
   auto encTy = dyn_cast<tv::TensorViewType>(viewVal.getType());
   if (!encTy)
     return vi;
-  // Partition views traverse by their tile size.
-  ArrayRef<int64_t> tile, traversal;
   Attribute encoding = encTy.getEncoding();
-  if (auto p = dyn_cast_or_null<tv::PartitionViewAttr>(encoding)) {
-    tile = p.getTile();
-    traversal = p.getTile();
-  } else if (auto s = dyn_cast_or_null<tv::StridedViewAttr>(encoding)) {
-    if (s.getTile().size() != s.getTraversalStrides().size())
-      return vi;
-    tile = s.getTile();
-    traversal = s.getTraversalStrides();
-  } else if (auto g = dyn_cast_or_null<tv::GatherScatterViewAttr>(encoding)) {
-    tile = g.getTile();
-    traversal = g.getTile();
-    vi.sparseDims.assign(g.getSparseDim().begin(), g.getSparseDim().end());
-    if (vi.sparseDims.empty())
-      return vi;
-  } else {
+  if (!tv::isViewEncoding(encoding))
     return vi;
-  }
+  SmallVector<int64_t> tile = tv::getEncodingTileShape(encoding);
+  SmallVector<int64_t> traversal = tv::getEncodingTraversal(encoding);
+  if (tile.size() != traversal.size())
+    return vi;
+  vi.sparseDims = tv::getEncodingSparseDims(encoding);
+  if (isa<tv::GatherScatterViewAttr>(encoding) && vi.sparseDims.empty())
+    return vi;
 
   // Follow the encoded view to its base view.
   Operation *viewOp = viewVal.getDefiningOp();
@@ -174,7 +164,7 @@ static ViewInfo traceView(Value viewVal) {
 }
 
 /// Drop tile-size-one dimensions from DMA shapes, retaining at least rank one.
-static SmallVector<unsigned> nonPinnedDims(ArrayRef<int64_t> tile) {
+static SmallVector<unsigned> getNonPinnedDims(ArrayRef<int64_t> tile) {
   SmallVector<unsigned> kept;
   for (unsigned d = 0; d < tile.size(); ++d)
     if (tile[d] != 1)
@@ -202,8 +192,8 @@ buildPinnedDimReassociation(ArrayRef<unsigned> kept, unsigned rank) {
 
 /// Reinterpret the base as a GM tile, optionally collapsing pinned dimensions
 /// for backend DMA rank limits.
-static Value emitGmTile(OpBuilder &b, Location loc, const ViewInfo &vi,
-                        Value off, bool collapse) {
+static Value createGmTile(OpBuilder &b, Location loc, const ViewData &vi,
+                          Value off, bool collapse) {
   MLIRContext *ctx = b.getContext();
   if (!collapse) {
     SmallVector<OpFoldResult> sizes, strides;
@@ -220,7 +210,7 @@ static Value emitGmTile(OpBuilder &b, Location loc, const ViewInfo &vi,
     return b.create<memref::ReinterpretCastOp>(loc, gmTileTy, vi.base,
                                                OpFoldResult(off), sizes, strides);
   }
-  SmallVector<unsigned> kept = nonPinnedDims(vi.tile);
+  SmallVector<unsigned> kept = getNonPinnedDims(vi.tile);
   SmallVector<int64_t> collapsedShape, collapsedStrideStatic;
   SmallVector<OpFoldResult> sizes, strides;
   for (unsigned d : kept) {
@@ -240,7 +230,7 @@ static Value emitGmTile(OpBuilder &b, Location loc, const ViewInfo &vi,
 }
 
 /// Compute the physical tile-origin offset.
-static Value computeOffset(OpBuilder &b, Location loc, const ViewInfo &vi,
+static Value computeOffset(OpBuilder &b, Location loc, const ViewData &vi,
                            ValueRange indices) {
   Value off;
   for (unsigned d = 0; d < vi.rank; ++d) {
@@ -253,8 +243,8 @@ static Value computeOffset(OpBuilder &b, Location loc, const ViewInfo &vi,
 }
 
 /// Return the in-bounds prefix of a memref.
-static Value emitPrefixSubview(OpBuilder &b, Location loc, Value src,
-                               ValueRange lens) {
+static Value createPrefixSubview(OpBuilder &b, Location loc, Value src,
+                                 ValueRange lens) {
   SmallVector<OpFoldResult> offsets, sizes, strides;
   for (Value len : lens) {
     offsets.push_back(b.getIndexAttr(0));
@@ -273,8 +263,8 @@ static bool isSentinelExtent(Value v) {
 }
 
 /// Compute the in-bounds tile lengths and physical origin.
-static Value emitTailGeometry(OpBuilder &b, Location loc, const ViewInfo &vi,
-                              ValueRange indices, SmallVectorImpl<Value> &lens) {
+static Value createTailGeometry(OpBuilder &b, Location loc, const ViewData &vi,
+                                ValueRange indices, SmallVectorImpl<Value> &lens) {
   Value off;
   for (unsigned d = 0; d < vi.rank; ++d) {
     Value cTrav = b.create<arith::ConstantIndexOp>(loc, vi.traversal[d]);
@@ -295,8 +285,8 @@ static Value asIndex(OpBuilder &b, Location loc, Value value) {
 }
 
 /// Reinterpret a scalar GM element at the given offset.
-static Value emitScalarGmElem(OpBuilder &b, Location loc, Value base, Value ik,
-                              Type elemTy) {
+static Value createScalarGmElem(OpBuilder &b, Location loc, Value base, Value ik,
+                                Type elemTy) {
   auto layout = StridedLayoutAttr::get(b.getContext(),
                                        /*offset=*/ShapedType::kDynamic, {1});
   auto ty = MemRefType::get({1}, elemTy, layout);
@@ -307,11 +297,11 @@ static Value emitScalarGmElem(OpBuilder &b, Location loc, Value base, Value ik,
 }
 
 /// Compute the contiguous block geometry for one sparse index.
-static void emitBlockGeometry(OpBuilder &b, Location loc, const ViewInfo &vi,
-                              ValueRange indices, unsigned sparseDim, Value sIdx,
-                              Value &off, SmallVectorImpl<OpFoldResult> &sizes,
-                              SmallVectorImpl<OpFoldResult> &strides,
-                              SmallVectorImpl<OpFoldResult> &subOffs) {
+static void createBlockGeometry(OpBuilder &b, Location loc, const ViewData &vi,
+                                ValueRange indices, unsigned sparseDim, Value sIdx,
+                                Value &off, SmallVectorImpl<OpFoldResult> &sizes,
+                                SmallVectorImpl<OpFoldResult> &strides,
+                                SmallVectorImpl<OpFoldResult> &subOffs) {
   for (unsigned d = 0; d < vi.rank; ++d) {
     int64_t blk = (d == sparseDim) ? 1 : vi.tile[d];
     Value logical =
@@ -330,9 +320,9 @@ static void emitBlockGeometry(OpBuilder &b, Location loc, const ViewInfo &vi,
 }
 
 /// Gather contiguous blocks along one sparse dimension.
-static Value emitBlockGather(OpBuilder &b, Location loc, const ViewInfo &vi,
-                             Value base, ValueRange indices, unsigned sparseDim,
-                             RankedTensorType resultType) {
+static Value createBlockGather(OpBuilder &b, Location loc, const ViewData &vi,
+                               Value base, ValueRange indices, unsigned sparseDim,
+                               RankedTensorType resultType) {
   auto bufTy = MemRefType::get(vi.tile, vi.elementType);
   Value buf = b.create<memref::AllocOp>(loc, bufTy);
   SmallVector<int64_t> blk(vi.tile.begin(), vi.tile.end());
@@ -355,8 +345,8 @@ static Value emitBlockGather(OpBuilder &b, Location loc, const ViewInfo &vi,
 
     Value off;
     SmallVector<OpFoldResult> sizes, strides, subOffs;
-    emitBlockGeometry(b, loc, vi, indices, sparseDim, sIdx, off, sizes, strides,
-                      subOffs);
+    createBlockGeometry(b, loc, vi, indices, sparseDim, sIdx, off, sizes, strides,
+                        subOffs);
     subOffs[sparseDim] = OpFoldResult(k);
     SmallVector<OpFoldResult> subStr(vi.rank, b.getIndexAttr(1));
     Value gm = b.create<memref::ReinterpretCastOp>(loc, gmBlkTy, base,
@@ -370,9 +360,9 @@ static Value emitBlockGather(OpBuilder &b, Location loc, const ViewInfo &vi,
 }
 
 /// Scatter contiguous blocks along one sparse dimension.
-static void emitBlockScatter(OpBuilder &b, Location loc, const ViewInfo &vi,
-                             Value base, Value value, ValueRange indices,
-                             unsigned sparseDim) {
+static void createBlockScatter(OpBuilder &b, Location loc, const ViewData &vi,
+                               Value base, Value value, ValueRange indices,
+                               unsigned sparseDim) {
   SmallVector<int64_t> blk(vi.tile.begin(), vi.tile.end());
   blk[sparseDim] = 1;
   auto layout = StridedLayoutAttr::get(b.getContext(), ShapedType::kDynamic,
@@ -393,8 +383,8 @@ static void emitBlockScatter(OpBuilder &b, Location loc, const ViewInfo &vi,
 
     Value off;
     SmallVector<OpFoldResult> sizes, strides, subOffs;
-    emitBlockGeometry(b, loc, vi, indices, sparseDim, sIdx, off, sizes, strides,
-                      subOffs);
+    createBlockGeometry(b, loc, vi, indices, sparseDim, sIdx, off, sizes, strides,
+                        subOffs);
     subOffs[sparseDim] = OpFoldResult(k);
     SmallVector<OpFoldResult> subStr(vi.rank, b.getIndexAttr(1));
     Value gm = b.create<memref::ReinterpretCastOp>(loc, gmBlkTy, base,
@@ -408,7 +398,7 @@ static void emitBlockScatter(OpBuilder &b, Location loc, const ViewInfo &vi,
 }
 
 /// Return whether a sparse access contains a regular contiguous block.
-static bool canBlockCopy(const ViewInfo &vi, unsigned sparseDim) {
+static bool canBlockCopy(const ViewData &vi, unsigned sparseDim) {
   for (unsigned d = 0; d < vi.rank; ++d)
     if (d != sparseDim && vi.strideStatic[d] == 1)
       return true;
@@ -418,7 +408,7 @@ static bool canBlockCopy(const ViewInfo &vi, unsigned sparseDim) {
 /// Compute a scalar gather/scatter offset for regular and sparse dimensions.
 /// Scalar accesses intentionally omit the block-DMA marker.
 static Value computeElementOffset(OpBuilder &b, Location loc,
-                                  const ViewInfo &vi, ValueRange indices,
+                                  const ViewData &vi, ValueRange indices,
                                   ArrayRef<int64_t> sparseDims,
                                   ValueRange coords) {
   Value offset;
@@ -454,10 +444,11 @@ static Value extractWideMaskElem(OpBuilder &b, Location loc, Value maskWide,
 }
 
 /// Gather elementwise when block DMA cannot represent the sparse access.
-static Value emitElementwiseGather(OpBuilder &b, Location loc, const ViewInfo &vi,
-                                   Value base, ValueRange indices,
-                                   ArrayRef<int64_t> sparseDims, Value mask,
-                                   RankedTensorType resultType) {
+static Value createElementwiseGather(OpBuilder &b, Location loc,
+                                     const ViewData &vi, Value base,
+                                     ValueRange indices,
+                                     ArrayRef<int64_t> sparseDims, Value mask,
+                                     RankedTensorType resultType) {
   Value init = b.create<tensor::EmptyOp>(loc, resultType.getShape(),
                                          resultType.getElementType());
   Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
@@ -479,7 +470,7 @@ static Value emitElementwiseGather(OpBuilder &b, Location loc, const ViewInfo &v
   Value target = loops.back().getRegionIterArg(0);
   auto doLoad = [&](OpBuilder &bb) -> Value {
     Value offset = computeElementOffset(bb, loc, vi, indices, sparseDims, coords);
-    Value rc = emitScalarGmElem(bb, loc, base, offset, vi.elementType);
+    Value rc = createScalarGmElem(bb, loc, base, offset, vi.elementType);
     return bb.create<memref::LoadOp>(loc, rc, ValueRange{c0});
   };
 
@@ -509,10 +500,10 @@ static Value emitElementwiseGather(OpBuilder &b, Location loc, const ViewInfo &v
 }
 
 /// Scatter elementwise when block DMA cannot represent the sparse access.
-static void emitElementwiseScatter(OpBuilder &b, Location loc,
-                                   const ViewInfo &vi, Value base, Value value,
-                                   ValueRange indices,
-                                   ArrayRef<int64_t> sparseDims, Value mask) {
+static void createElementwiseScatter(OpBuilder &b, Location loc,
+                                     const ViewData &vi, Value base,
+                                     Value value, ValueRange indices,
+                                     ArrayRef<int64_t> sparseDims, Value mask) {
   Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
   Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
   OpBuilder::InsertionGuard guard(b);
@@ -528,7 +519,7 @@ static void emitElementwiseScatter(OpBuilder &b, Location loc,
   auto doStore = [&](OpBuilder &bb) {
     Value offset = computeElementOffset(bb, loc, vi, indices, sparseDims, coords);
     auto elem = bb.create<tensor::ExtractOp>(loc, value, coords);
-    Value rc = emitScalarGmElem(bb, loc, base, offset, vi.elementType);
+    Value rc = createScalarGmElem(bb, loc, base, offset, vi.elementType);
     Value empty =
         bb.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{1}, vi.elementType);
     Value ins = bb.create<tensor::InsertOp>(loc, elem.getResult(), empty,
@@ -549,23 +540,23 @@ static void emitElementwiseScatter(OpBuilder &b, Location loc,
 }
 
 /// Use block DMA only for an unmasked, non-contiguous single sparse dimension.
-static Value emitScalarGather(OpBuilder &b, Location loc, const ViewInfo &vi,
-                              Value base, ValueRange indices,
-                              ArrayRef<int64_t> sparseDims, Value mask,
-                              RankedTensorType resultType) {
+static Value createScalarGather(OpBuilder &b, Location loc, const ViewData &vi,
+                                Value base, ValueRange indices,
+                                ArrayRef<int64_t> sparseDims, Value mask,
+                                RankedTensorType resultType) {
   if (!mask && sparseDims.size() == 1 && canBlockCopy(vi, sparseDims[0]))
-    return emitBlockGather(b, loc, vi, base, indices, sparseDims[0], resultType);
-  return emitElementwiseGather(b, loc, vi, base, indices, sparseDims, mask,
-                               resultType);
+    return createBlockGather(b, loc, vi, base, indices, sparseDims[0], resultType);
+  return createElementwiseGather(b, loc, vi, base, indices, sparseDims, mask,
+                                 resultType);
 }
 
-static void emitScalarScatter(OpBuilder &b, Location loc, const ViewInfo &vi,
-                              Value base, Value value, ValueRange indices,
-                              ArrayRef<int64_t> sparseDims, Value mask) {
+static void createScalarScatter(OpBuilder &b, Location loc, const ViewData &vi,
+                                Value base, Value value, ValueRange indices,
+                                ArrayRef<int64_t> sparseDims, Value mask) {
   if (!mask && sparseDims.size() == 1 && canBlockCopy(vi, sparseDims[0]))
-    emitBlockScatter(b, loc, vi, base, value, indices, sparseDims[0]);
+    createBlockScatter(b, loc, vi, base, value, indices, sparseDims[0]);
   else
-    emitElementwiseScatter(b, loc, vi, base, value, indices, sparseDims, mask);
+    createElementwiseScatter(b, loc, vi, base, value, indices, sparseDims, mask);
 }
 
 //===----------------------------------------------------------------------===//
@@ -573,7 +564,7 @@ static void emitScalarScatter(OpBuilder &b, Location loc, const ViewInfo &vi,
 //===----------------------------------------------------------------------===//
 
 static LogicalResult lowerViewLoad(tv::ViewLoadOp load) {
-  ViewInfo vi = traceView(load.getView());
+  ViewData vi = parseView(load.getView());
   if (!vi.ok || load.getIndices().size() != vi.rank)
     return failure();
 
@@ -589,15 +580,15 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load) {
     }
 
     // Sparse boundaries are represented by the explicit per-lane mask.
-    Value result = emitScalarGather(b, loc, vi, vi.base, load.getIndices(),
-                                    vi.sparseDims, load.getMask(), tensorTy);
+    Value result = createScalarGather(b, loc, vi, vi.base, load.getIndices(),
+                                      vi.sparseDims, load.getMask(), tensorTy);
     load.getResult().replaceAllUsesWith(result);
     load.erase();
     return success();
   }
 
   // The backend assigns the staging buffer's memory space from its consumers.
-  SmallVector<unsigned> kept = nonPinnedDims(vi.tile);
+  SmallVector<unsigned> kept = getNonPinnedDims(vi.tile);
   bool collapsed = kept.size() != vi.rank;
   auto localTy = MemRefType::get(vi.tile, vi.elementType);
   SmallVector<int64_t> collapsedTile;
@@ -615,12 +606,12 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load) {
 
   if (!masked) {
     Value off = computeOffset(b, loc, vi, load.getIndices());
-    Value gm = emitGmTile(b, loc, vi, off, /*collapse=*/true);
+    Value gm = createGmTile(b, loc, vi, off, /*collapse=*/true);
     b.create<memref::CopyOp>(loc, gm, buf);
   } else {
     SmallVector<Value> lens;
-    Value off = emitTailGeometry(b, loc, vi, load.getIndices(), lens);
-    Value gm = emitGmTile(b, loc, vi, off, /*collapse=*/true);
+    Value off = createTailGeometry(b, loc, vi, load.getIndices(), lens);
+    Value gm = createGmTile(b, loc, vi, off, /*collapse=*/true);
     // Zero-pad the tile before copying its in-bounds prefix.
     Value zero =
         b.create<arith::ConstantOp>(loc, b.getZeroAttr(vi.elementType));
@@ -628,8 +619,8 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load) {
     SmallVector<Value> collapsedLens;
     for (unsigned d : kept)
       collapsedLens.push_back(lens[d]);
-    Value gmSub = emitPrefixSubview(b, loc, gm, collapsedLens);
-    Value bufSub = emitPrefixSubview(b, loc, buf, collapsedLens);
+    Value gmSub = createPrefixSubview(b, loc, gm, collapsedLens);
+    Value bufSub = createPrefixSubview(b, loc, buf, collapsedLens);
     b.create<memref::CopyOp>(loc, gmSub, bufSub);
   }
 
@@ -647,7 +638,7 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load) {
 }
 
 static LogicalResult lowerViewStore(tv::ViewStoreOp store) {
-  ViewInfo vi = traceView(store.getView());
+  ViewData vi = parseView(store.getView());
   if (!vi.ok || store.getIndices().size() != vi.rank)
     return failure();
 
@@ -662,8 +653,8 @@ static LogicalResult lowerViewStore(tv::ViewStoreOp store) {
     }
 
     // Sparse boundaries are represented by the explicit per-lane mask.
-    emitScalarScatter(b, loc, vi, vi.base, store.getValue(),
-                      store.getIndices(), vi.sparseDims, store.getMask());
+    createScalarScatter(b, loc, vi, vi.base, store.getValue(),
+                        store.getIndices(), vi.sparseDims, store.getMask());
     store.erase();
     return success();
   }
@@ -681,14 +672,14 @@ static LogicalResult lowerViewStore(tv::ViewStoreOp store) {
 
   if (!masked) {
     Value off = computeOffset(b, loc, vi, store.getIndices());
-    Value gm = emitGmTile(b, loc, vi, off, /*collapse=*/false);
+    Value gm = createGmTile(b, loc, vi, off, /*collapse=*/false);
     auto mat = b.create<bufferization::MaterializeInDestinationOp>(loc, value, gm);
     mat->setAttr("writable", b.getUnitAttr());
   } else {
     SmallVector<Value> lens;
-    Value off = emitTailGeometry(b, loc, vi, store.getIndices(), lens);
-    Value gm = emitGmTile(b, loc, vi, off, /*collapse=*/false);
-    Value gmSub = emitPrefixSubview(b, loc, gm, lens);
+    Value off = createTailGeometry(b, loc, vi, store.getIndices(), lens);
+    Value gm = createGmTile(b, loc, vi, off, /*collapse=*/false);
+    Value gmSub = createPrefixSubview(b, loc, gm, lens);
     // Store only the in-bounds prefix.
     SmallVector<OpFoldResult> offs, szs, strs;
     for (Value len : lens) {
@@ -741,7 +732,7 @@ static LogicalResult lowerPtrLoad(tv::PtrLoadOp op) {
     Value k = loop.getInductionVar();
     auto ext = b.create<tensor::ExtractOp>(loc, idx, ValueRange{k});
     ext->setAttr("DiscreteMemAccess", b.getUnitAttr());
-    Value rc = emitScalarGmElem(b, loc, base, ext.getResult(), elemTy);
+    Value rc = createScalarGmElem(b, loc, base, ext.getResult(), elemTy);
     Value v = b.create<memref::LoadOp>(loc, rc, ValueRange{c0});
     b.create<memref::StoreOp>(loc, v, buf, ValueRange{k});
   }
@@ -784,7 +775,7 @@ static LogicalResult lowerPtrStore(tv::PtrStoreOp op) {
     extIdx->setAttr("DiscreteMemAccess", b.getUnitAttr());
     auto extVal = b.create<tensor::ExtractOp>(loc, value, ValueRange{k});
     extVal->setAttr("DiscreteMemAccess", b.getUnitAttr());
-    Value rc = emitScalarGmElem(b, loc, base, extIdx.getResult(), elemTy);
+    Value rc = createScalarGmElem(b, loc, base, extIdx.getResult(), elemTy);
     Value empty = b.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{1}, elemTy);
     Value ins =
         b.create<tensor::InsertOp>(loc, extVal.getResult(), empty, ValueRange{c0});

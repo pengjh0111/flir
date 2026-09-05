@@ -36,6 +36,13 @@ int64_t getEncodingIndexSpaceRank(Attribute enc);
 // Out-of-bounds padding kind carried by a view encoding.
 PadKind getEncodingPadding(Attribute enc);
 
+// Per-dim traversal stride: the strided view's own field, or the tile shape
+// itself for partition/gather-scatter views (which traverse tile-by-tile).
+llvm::SmallVector<int64_t> getEncodingTraversal(Attribute enc);
+
+// Gather/scatter dimensions of a view encoding (empty for non-gather-scatter).
+llvm::SmallVector<int64_t> getEncodingSparseDims(Attribute enc);
+
 } // namespace tv
 } // namespace triton
 } // namespace mlir
