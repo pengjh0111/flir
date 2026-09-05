@@ -30,17 +30,9 @@ namespace tv = mlir::triton::tv;
 
 namespace {
 
-static Type getPtrPointeeType(Type type) {
-  if (auto ptr = dyn_cast<tv::PtrType>(type))
-    return ptr.getPointeeType();
-  if (auto ptr = dyn_cast<triton::PointerType>(type))
-    return ptr.getPointeeType();
-  return Type();
-}
-
-static Value buildBaseView(OpBuilder &b, Location loc, Value basePtr,
-                           Type elementType, ArrayRef<int64_t> strideStatic,
-                           ArrayRef<Value> strideDyn, ArrayRef<Value> extent) {
+static Value createBaseView(OpBuilder &b, Location loc, Value basePtr,
+                            Type elementType, ArrayRef<int64_t> strideStatic,
+                            ArrayRef<Value> strideDyn, ArrayRef<Value> extent) {
   basePtr = tv::ensureTvPtr(basePtr);
   unsigned rank = strideStatic.size();
 
@@ -77,10 +69,10 @@ static Value buildBaseView(OpBuilder &b, Location loc, Value basePtr,
       .getResult();
 }
 
-static Value attachViewEncoding(OpBuilder &b, Location loc, Value baseView,
-                                ArrayRef<int64_t> tile,
-                                ArrayRef<int64_t> traversal,
-                                ArrayRef<int64_t> sparseDims) {
+static Value createEncodedView(OpBuilder &b, Location loc, Value baseView,
+                               ArrayRef<int64_t> tile,
+                               ArrayRef<int64_t> traversal,
+                               ArrayRef<int64_t> sparseDims) {
   MLIRContext *ctx = b.getContext();
   auto baseTy = cast<tv::TensorViewType>(baseView.getType());
   ArrayRef<int64_t> strideTy = baseTy.getStrides();
@@ -167,15 +159,15 @@ Value createTensorViewBase(OpBuilder &b, Location loc, Value basePtr,
   SmallVector<int64_t> strideStatic(rank, ShapedType::kDynamic);
   SmallVector<Value> strideDyn(strides.begin(), strides.end());
   SmallVector<Value> extent(shape.begin(), shape.end());
-  return buildBaseView(b, loc, basePtr, elementType, strideStatic, strideDyn,
-                       extent);
+  return createBaseView(b, loc, basePtr, elementType, strideStatic, strideDyn,
+                        extent);
 }
 
 Value tensorViewLoad(OpBuilder &b, Location loc, Value baseView,
                      ArrayRef<int64_t> tile, ArrayRef<int64_t> traversal,
                      ArrayRef<int64_t> sparseDims, ValueRange index,
                      Type resultTy, Value mask) {
-  Value view = attachViewEncoding(
+  Value view = createEncodedView(
       b, loc, baseView, tile, traversal.empty() ? tile : traversal, sparseDims);
   return b
       .create<tv::ViewLoadOp>(loc, resultTy, view,
@@ -187,7 +179,7 @@ void tensorViewStore(OpBuilder &b, Location loc, Value baseView,
                      ArrayRef<int64_t> tile, ArrayRef<int64_t> traversal,
                      ArrayRef<int64_t> sparseDims, ValueRange index,
                      Value value, Value mask) {
-  Value view = attachViewEncoding(
+  Value view = createEncodedView(
       b, loc, baseView, tile, traversal.empty() ? tile : traversal, sparseDims);
   b.create<tv::ViewStoreOp>(loc, view, value,
                             castIndices(b, loc, index, sparseDims), mask);

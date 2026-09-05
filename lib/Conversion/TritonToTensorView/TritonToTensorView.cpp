@@ -43,15 +43,6 @@ namespace {
 // Shared helpers
 //===----------------------------------------------------------------------===//
 
-/// Return the pointee type of a Triton or TensorView pointer.
-static Type getPtrPointeeType(Type t) {
-  if (auto p = dyn_cast<tv::PtrType>(t))
-    return p.getPointeeType();
-  if (auto p = dyn_cast<triton::PointerType>(t))
-    return p.getPointeeType();
-  return Type();
-}
-
 /// True for a regular, arange-based tile offset (`make_range`, or
 /// `origin + make_range`) -- a dense access that belongs on the native path,
 /// not the discrete pointer fallback.
@@ -91,7 +82,7 @@ static bool matchPtrAccess(OpBuilder &b, Location loc, Value ptrTensor,
     scalarOffset = scalarAp.getOffset();
     scalarPtr = scalarAp.getPtr();
   }
-  if (!getPtrPointeeType(scalarPtr.getType()))
+  if (!tv::getPtrPointeeType(scalarPtr.getType()))
     return false;
 
   basePtr = scalarPtr;
@@ -178,6 +169,14 @@ static void eraseIfDeadPtrChain(Value v) {
 namespace mlir {
 namespace triton {
 namespace tv {
+
+Type getPtrPointeeType(Type t) {
+  if (auto p = dyn_cast<tv::PtrType>(t))
+    return p.getPointeeType();
+  if (auto p = dyn_cast<triton::PointerType>(t))
+    return p.getPointeeType();
+  return Type();
+}
 
 Value ensureTvPtr(Value v) {
   if (isa<tv::PtrType>(v.getType()))

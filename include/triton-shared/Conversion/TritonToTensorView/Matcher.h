@@ -22,6 +22,9 @@ namespace mlir {
 namespace triton {
 namespace tv {
 
+// Pointee type of a `!tv.ptr<T>` or `!tt.ptr<T>`, or null for anything else.
+Type getPtrPointeeType(Type t);
+
 // Retype a matched pointer and synchronize its function signature if needed.
 Value ensureTvPtr(Value v);
 

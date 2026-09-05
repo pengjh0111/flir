@@ -224,3 +224,23 @@ PadKind mlir::triton::tv::getEncodingPadding(Attribute enc) {
       .Case<GatherScatterViewAttr>([](auto a) { return a.getPadding(); })
       .Default([](Attribute) { return PadKind::Zero; });
 }
+
+llvm::SmallVector<int64_t>
+mlir::triton::tv::getEncodingTraversal(Attribute enc) {
+  return llvm::TypeSwitch<Attribute, llvm::SmallVector<int64_t>>(enc)
+      .Case<PartitionViewAttr>(
+          [](auto a) { return llvm::to_vector(a.getTile()); })
+      .Case<StridedViewAttr>(
+          [](auto a) { return llvm::to_vector(a.getTraversalStrides()); })
+      .Case<GatherScatterViewAttr>(
+          [](auto a) { return llvm::to_vector(a.getTile()); })
+      .Default([](Attribute) { return llvm::SmallVector<int64_t>{}; });
+}
+
+llvm::SmallVector<int64_t>
+mlir::triton::tv::getEncodingSparseDims(Attribute enc) {
+  return llvm::TypeSwitch<Attribute, llvm::SmallVector<int64_t>>(enc)
+      .Case<GatherScatterViewAttr>(
+          [](auto a) { return llvm::to_vector(a.getSparseDim()); })
+      .Default([](Attribute) { return llvm::SmallVector<int64_t>{}; });
+}
