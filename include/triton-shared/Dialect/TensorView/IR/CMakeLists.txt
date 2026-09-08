@@ -15,6 +15,8 @@ mlir_tablegen(TensorViewTypes.cpp.inc -gen-typedef-defs)
 add_public_tablegen_target(TensorViewTypesIncGen)
 
 set(LLVM_TARGET_DEFINITIONS TensorViewAttrs.td)
+mlir_tablegen(TensorViewEnums.h.inc -gen-enum-decls)
+mlir_tablegen(TensorViewEnums.cpp.inc -gen-enum-defs)
 mlir_tablegen(TensorViewAttrs.h.inc -gen-attrdef-decls)
 mlir_tablegen(TensorViewAttrs.cpp.inc -gen-attrdef-defs)
 add_public_tablegen_target(TensorViewAttrsIncGen)

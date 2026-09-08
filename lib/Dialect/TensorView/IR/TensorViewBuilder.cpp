@@ -168,8 +168,10 @@ FailureOr<Value> createTensorViewBase(OpBuilder &b, Location loc, Value basePtr,
 }
 
 Value createPartitionView(OpBuilder &b, Location loc, Value baseView,
-                          ArrayRef<int64_t> tile) {
-  auto encoding = tv::PartitionViewAttr::get(b.getContext(), tile);
+                          ArrayRef<int64_t> tile,
+                          PaddingValue paddingValue) {
+  auto encoding =
+      tv::PartitionViewAttr::get(b.getContext(), tile, paddingValue);
   auto resultType = getEncodedViewType(baseView, encoding);
   return b.create<tv::MakePartitionViewOp>(loc, resultType, baseView)
       .getResult();
@@ -177,18 +179,20 @@ Value createPartitionView(OpBuilder &b, Location loc, Value baseView,
 
 Value createStridedView(OpBuilder &b, Location loc, Value baseView,
                         ArrayRef<int64_t> tile,
-                        ArrayRef<int64_t> traversalStrides) {
-  auto encoding =
-      tv::StridedViewAttr::get(b.getContext(), tile, traversalStrides);
+                        ArrayRef<int64_t> traversalStrides,
+                        PaddingValue paddingValue) {
+  auto encoding = tv::StridedViewAttr::get(b.getContext(), tile,
+                                           traversalStrides, paddingValue);
   auto resultType = getEncodedViewType(baseView, encoding);
   return b.create<tv::MakeStridedViewOp>(loc, resultType, baseView).getResult();
 }
 
 Value createGatherScatterView(OpBuilder &b, Location loc, Value baseView,
                               ArrayRef<int64_t> tile,
-                              ArrayRef<int64_t> sparseDims) {
-  auto encoding =
-      tv::GatherScatterViewAttr::get(b.getContext(), tile, sparseDims);
+                              ArrayRef<int64_t> sparseDims,
+                              PaddingValue paddingValue) {
+  auto encoding = tv::GatherScatterViewAttr::get(b.getContext(), tile,
+                                                 sparseDims, paddingValue);
   auto resultType = getEncodedViewType(baseView, encoding);
   return b.create<tv::MakeGatherScatterViewOp>(loc, resultType, baseView)
       .getResult();

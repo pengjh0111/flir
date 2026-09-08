@@ -51,7 +51,8 @@ def TV_MakeTensorViewOp : TensorView_Op<"make_tensor_view",
 // attach a view encoding to a base tensor_view.
 //===----------------------------------------------------------------------===//
 class TV_MakeViewOp<string mnemonic>
-    : TensorView_Op<mnemonic, [Pure, DeclareOpInterfaceMethods<ViewOpInterface>]> {
+    : TensorView_Op<mnemonic, [Pure, TensorViewEncodingOpInterface,
+                               DeclareOpInterfaceMethods<ViewOpInterface>]> {
   let arguments = (ins TV_TensorViewType:$source);
   let results = (outs TV_TensorViewType:$result);
   let hasVerifier = 1;
@@ -74,6 +75,10 @@ def TV_MakeGatherScatterViewOp : TV_MakeViewOp<"make_gather_scatter_view"> {
 def TV_ViewLoadOp : TensorView_Op<"view_load",
     [DeclareOpInterfaceMethods<ViewOpInterface>, MemoryEffects<[MemRead]>]> {
   let summary = "Load the tile at the given index-space position into a tensor.";
+  let description = [{
+    Elements outside the base view's logical shape are replaced with the
+    padding value carried by the view encoding.
+  }];
   let arguments = (ins
     TV_TensorViewType:$view,
     Variadic<TV_ViewIndex>:$indices);
@@ -88,6 +93,9 @@ def TV_ViewLoadOp : TensorView_Op<"view_load",
 def TV_ViewStoreOp : TensorView_Op<"view_store",
     [DeclareOpInterfaceMethods<ViewOpInterface>, MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tensor into the tile at the given index-space position.";
+  let description = [{
+    Elements outside the base view's logical shape are not written.
+  }];
   let arguments = (ins
     TV_TensorViewType:$view,
     AnyRankedTensor:$value,

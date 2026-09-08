@@ -39,6 +39,10 @@ static LogicalResult verifyEncodingParent(Operation *op, TensorViewType src,
       src.getStrides() != res.getStrides() ||
       src.getElementType() != res.getElementType())
     return op->emitOpError("result must match source except for the encoding");
+  if (getEncodingPaddingValue(res.getEncoding()) != PaddingValue::ZERO &&
+      !isa<FloatType>(res.getElementType()))
+    return op->emitOpError(
+        "nan and infinity padding require a floating-point element type");
   return success();
 }
 

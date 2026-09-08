@@ -11,6 +11,22 @@
 
 include "mlir/IR/OpBase.td"
 
+def TensorViewEncodingOpInterface
+    : OpInterface<"TensorViewEncodingOpInterface"> {
+  let description = [{
+    Common interface for operations that attach an encoding to a base
+    `tv.tensor_view`.
+  }];
+  let cppNamespace = "::mlir::triton::tv";
+
+  let methods = [
+    InterfaceMethod<
+      /*desc=*/"Return the base tensor view.",
+      /*retTy=*/"::mlir::Value",
+      /*methodName=*/"getSource">
+  ];
+}
+
 def ViewOpInterface : OpInterface<"ViewOpInterface"> {
   let description = [{
     Common interface for ops that produce or consume an encoded `tv.tensor_view`

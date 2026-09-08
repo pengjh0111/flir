@@ -14,6 +14,8 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include "triton-shared/Dialect/TensorView/IR/TensorViewEnums.h.inc"
+
 #define GET_ATTRDEF_CLASSES
 #include "triton-shared/Dialect/TensorView/IR/TensorViewAttrs.h.inc"
 
@@ -36,6 +38,9 @@ llvm::SmallVector<int64_t> getEncodingTraversal(Attribute enc);
 
 // Gather/scatter dimensions of a view encoding (empty for non-gather-scatter).
 llvm::SmallVector<int64_t> getEncodingSparseDims(Attribute enc);
+
+// Padding value used by out-of-bounds view loads.
+PaddingValue getEncodingPaddingValue(Attribute enc);
 
 } // namespace tv
 } // namespace triton

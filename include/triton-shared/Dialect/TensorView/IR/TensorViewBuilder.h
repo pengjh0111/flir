@@ -9,6 +9,8 @@
 #ifndef TRITON_SHARED_DIALECT_TENSOR_VIEW_BUILDER_H
 #define TRITON_SHARED_DIALECT_TENSOR_VIEW_BUILDER_H
 
+#include "triton-shared/Dialect/TensorView/IR/TensorViewAttrs.h"
+
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
@@ -30,13 +32,15 @@ FailureOr<Value> createTensorViewBase(OpBuilder &b, Location loc, Value basePtr,
 
 // Attach an explicit access encoding to a base view.
 Value createPartitionView(OpBuilder &b, Location loc, Value baseView,
-                          ArrayRef<int64_t> tile);
+                          ArrayRef<int64_t> tile, PaddingValue paddingValue);
 Value createStridedView(OpBuilder &b, Location loc, Value baseView,
                         ArrayRef<int64_t> tile,
-                        ArrayRef<int64_t> traversalStrides);
+                        ArrayRef<int64_t> traversalStrides,
+                        PaddingValue paddingValue);
 Value createGatherScatterView(OpBuilder &b, Location loc, Value baseView,
                               ArrayRef<int64_t> tile,
-                              ArrayRef<int64_t> sparseDims);
+                              ArrayRef<int64_t> sparseDims,
+                              PaddingValue paddingValue);
 
 // Access a tile through an already encoded view.
 Value tensorViewLoad(OpBuilder &b, Location loc, Value view, ValueRange index,

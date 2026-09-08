@@ -19,6 +19,8 @@
 using namespace mlir;
 using namespace mlir::triton::tv;
 
+#include "triton-shared/Dialect/TensorView/IR/TensorViewEnums.cpp.inc"
+
 #define GET_ATTRDEF_CLASSES
 #include "triton-shared/Dialect/TensorView/IR/TensorViewAttrs.cpp.inc"
 
@@ -34,7 +36,7 @@ void TensorViewDialect::registerAttributes() {
 //===----------------------------------------------------------------------===//
 // Custom assembly helpers for the encoding attributes.
 //
-//   #tv.partition_view<tile = [128], dim_map = [0]>
+//   #tv.partition_view<tile = [128], dim_map = [0], padding_value = zero>
 //===----------------------------------------------------------------------===//
 
 // Parse `<keyword> = [i64, i64, ...]`.
@@ -59,18 +61,50 @@ static void printIntArray(AsmPrinter &printer, StringRef keyword,
   printer << "]";
 }
 
+static ParseResult parsePaddingValue(AsmParser &parser, PaddingValue &value) {
+  if (parser.parseKeyword("padding_value") || parser.parseEqual())
+    return failure();
+  if (succeeded(parser.parseOptionalKeyword("zero"))) {
+    value = PaddingValue::ZERO;
+    return success();
+  }
+  if (succeeded(parser.parseOptionalKeyword("nan"))) {
+    value = PaddingValue::NAN_VALUE;
+    return success();
+  }
+  if (succeeded(parser.parseOptionalKeyword("inf"))) {
+    value = PaddingValue::POS_INF;
+    return success();
+  }
+  if (succeeded(parser.parseOptionalMinus())) {
+    if (parser.parseKeyword("inf"))
+      return failure();
+    value = PaddingValue::NEG_INF;
+    return success();
+  }
+  return parser.emitError(parser.getCurrentLocation(),
+                          "expected zero, nan, inf, or -inf");
+}
+
+static void printPaddingValue(AsmPrinter &printer, PaddingValue value) {
+  printer << "padding_value = ";
+  printer << stringifyPaddingValue(value);
+}
+
 //===----------------------------------------------------------------------===//
 // PartitionViewAttr assembly
 //===----------------------------------------------------------------------===//
 Attribute PartitionViewAttr::parse(AsmParser &parser, Type) {
   llvm::SMLoc loc = parser.getCurrentLocation();
   SmallVector<int64_t> tile, dimMap;
+  PaddingValue paddingValue;
   if (parser.parseLess() || parseKeywordIntArray(parser, "tile", tile) ||
       parser.parseComma() || parseKeywordIntArray(parser, "dim_map", dimMap) ||
+      parser.parseComma() || parsePaddingValue(parser, paddingValue) ||
       parser.parseGreater())
     return {};
   return getChecked([&] { return parser.emitError(loc); }, parser.getContext(),
-                    tile, dimMap);
+                    tile, dimMap, paddingValue);
 }
 
 void PartitionViewAttr::print(AsmPrinter &printer) const {
@@ -78,6 +112,8 @@ void PartitionViewAttr::print(AsmPrinter &printer) const {
   printIntArray(printer, "tile", getTile());
   printer << ", ";
   printIntArray(printer, "dim_map", getDimMap());
+  printer << ", ";
+  printPaddingValue(printer, getPaddingValue());
   printer << ">";
 }
 
@@ -87,14 +123,16 @@ void PartitionViewAttr::print(AsmPrinter &printer) const {
 Attribute StridedViewAttr::parse(AsmParser &parser, Type) {
   llvm::SMLoc loc = parser.getCurrentLocation();
   SmallVector<int64_t> tile, dimMap, traversalStrides;
+  PaddingValue paddingValue;
   if (parser.parseLess() || parseKeywordIntArray(parser, "tile", tile) ||
       parser.parseComma() || parseKeywordIntArray(parser, "dim_map", dimMap) ||
       parser.parseComma() ||
       parseKeywordIntArray(parser, "traversal_strides", traversalStrides) ||
+      parser.parseComma() || parsePaddingValue(parser, paddingValue) ||
       parser.parseGreater())
     return {};
   return getChecked([&] { return parser.emitError(loc); }, parser.getContext(),
-                    tile, dimMap, traversalStrides);
+                    tile, dimMap, traversalStrides, paddingValue);
 }
 
 void StridedViewAttr::print(AsmPrinter &printer) const {
@@ -104,6 +142,8 @@ void StridedViewAttr::print(AsmPrinter &printer) const {
   printIntArray(printer, "dim_map", getDimMap());
   printer << ", ";
   printIntArray(printer, "traversal_strides", getTraversalStrides());
+  printer << ", ";
+  printPaddingValue(printer, getPaddingValue());
   printer << ">";
 }
 
@@ -113,13 +153,15 @@ void StridedViewAttr::print(AsmPrinter &printer) const {
 Attribute GatherScatterViewAttr::parse(AsmParser &parser, Type) {
   llvm::SMLoc loc = parser.getCurrentLocation();
   SmallVector<int64_t> tile, sparseDim;
+  PaddingValue paddingValue;
   if (parser.parseLess() || parseKeywordIntArray(parser, "tile", tile) ||
       parser.parseComma() ||
       parseKeywordIntArray(parser, "sparse_dim", sparseDim) ||
+      parser.parseComma() || parsePaddingValue(parser, paddingValue) ||
       parser.parseGreater())
     return {};
   return getChecked([&] { return parser.emitError(loc); }, parser.getContext(),
-                    tile, sparseDim);
+                    tile, sparseDim, paddingValue);
 }
 
 void GatherScatterViewAttr::print(AsmPrinter &printer) const {
@@ -127,6 +169,8 @@ void GatherScatterViewAttr::print(AsmPrinter &printer) const {
   printIntArray(printer, "tile", getTile());
   printer << ", ";
   printIntArray(printer, "sparse_dim", getSparseDim());
+  printer << ", ";
+  printPaddingValue(printer, getPaddingValue());
   printer << ">";
 }
 
@@ -136,7 +180,8 @@ void GatherScatterViewAttr::print(AsmPrinter &printer) const {
 
 LogicalResult
 PartitionViewAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                          ArrayRef<int64_t> tile, ArrayRef<int64_t> dimMap) {
+                          ArrayRef<int64_t> tile, ArrayRef<int64_t> dimMap,
+                          PaddingValue) {
   if (tile.empty())
     return emitError() << "partition_view tile must be non-empty";
   if (tile.size() != dimMap.size())
@@ -150,7 +195,8 @@ PartitionViewAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 LogicalResult
 StridedViewAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                         ArrayRef<int64_t> tile, ArrayRef<int64_t> dimMap,
-                        ArrayRef<int64_t> traversalStrides) {
+                        ArrayRef<int64_t> traversalStrides,
+                        PaddingValue) {
   if (tile.empty())
     return emitError() << "strided_view tile must be non-empty";
   if (tile.size() != dimMap.size())
@@ -169,7 +215,8 @@ StridedViewAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 LogicalResult
 GatherScatterViewAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                               ArrayRef<int64_t> tile,
-                              ArrayRef<int64_t> sparseDim) {
+                              ArrayRef<int64_t> sparseDim,
+                              PaddingValue) {
   if (tile.empty())
     return emitError() << "gather_scatter_view tile must be non-empty";
   if (sparseDim.empty())
@@ -227,4 +274,12 @@ mlir::triton::tv::getEncodingSparseDims(Attribute enc) {
       .Case<GatherScatterViewAttr>(
           [](auto a) { return llvm::to_vector(a.getSparseDim()); })
       .Default([](Attribute) { return llvm::SmallVector<int64_t>{}; });
+}
+
+PaddingValue mlir::triton::tv::getEncodingPaddingValue(Attribute enc) {
+  return llvm::TypeSwitch<Attribute, PaddingValue>(enc)
+      .Case<PartitionViewAttr>([](auto a) { return a.getPaddingValue(); })
+      .Case<StridedViewAttr>([](auto a) { return a.getPaddingValue(); })
+      .Case<GatherScatterViewAttr>([](auto a) { return a.getPaddingValue(); })
+      .Default([](Attribute) { return PaddingValue::ZERO; });
 }
