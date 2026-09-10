@@ -22,7 +22,6 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -35,7 +34,6 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
-#include <optional>
 #include <utility>
 
 namespace mlir {
@@ -146,74 +144,11 @@ static Value materializeBase(OpBuilder &builder, Location loc,
       .getResult(0);
 }
 
-/// Physical layout of one GM-to-local transfer. The logical view keeps every
-/// dimension, while unit tile dimensions contribute only to the scalar origin
-/// offset and do not need to increase the DMA rank.
-struct PhysicalTransferLayout {
-  SmallVector<unsigned> logicalDims;
-  SmallVector<int64_t> shape;
-  SmallVector<int64_t> strideStatic;
-  SmallVector<ReassociationIndices> reassociation;
-
-  bool collapses(unsigned logicalRank) const {
-    return logicalDims.size() != logicalRank;
-  }
-};
-
-static std::optional<PhysicalTransferLayout>
-buildPhysicalTransferLayout(const ViewData &view) {
-  PhysicalTransferLayout layout;
-  for (unsigned d = 0; d < view.rank; ++d) {
-    if (view.tile[d] == 1)
-      continue;
-    layout.logicalDims.push_back(d);
-    layout.shape.push_back(view.tile[d]);
-    layout.strideStatic.push_back(view.strideStatic[d]);
-  }
-
-  // Keep transfers at least rank one even when the logical tile is all-unit.
-  if (layout.logicalDims.empty() && view.rank != 0) {
-    unsigned d = view.rank - 1;
-    layout.logicalDims.push_back(d);
-    layout.shape.push_back(view.tile[d]);
-    layout.strideStatic.push_back(view.strideStatic[d]);
-  }
-
-  if (!layout.collapses(view.rank))
-    return layout;
-
-  auto reassociation =
-      getReassociationIndicesForCollapse(view.tile, layout.shape);
-  if (!reassociation)
-    return std::nullopt;
-  layout.reassociation = std::move(*reassociation);
-  return layout;
-}
-
-/// Reinterpret the base as a GM tile. `transferLayout` selects a physical DMA
-/// rank distinct from the logical view rank; a null layout preserves the full
-/// logical tile shape.
 static Value createGmTileView(OpBuilder &b, Location loc, const ViewData &vi,
-                              Value off,
-                              const PhysicalTransferLayout *transferLayout) {
+                              Value off) {
   MLIRContext *ctx = b.getContext();
-  if (!transferLayout) {
-    SmallVector<OpFoldResult> sizes, strides;
-    for (unsigned d = 0; d < vi.rank; ++d) {
-      sizes.push_back(b.getIndexAttr(vi.tile[d]));
-      if (vi.strideStatic[d] == ShapedType::kDynamic)
-        strides.push_back(vi.strideVal[d]);
-      else
-        strides.push_back(b.getIndexAttr(vi.strideStatic[d]));
-    }
-    auto layout = StridedLayoutAttr::get(ctx, /*offset=*/ShapedType::kDynamic,
-                                         vi.strideStatic);
-    auto gmTileTy = MemRefType::get(vi.tile, vi.elementType, layout);
-    return b.create<memref::ReinterpretCastOp>(
-        loc, gmTileTy, vi.base, OpFoldResult(off), sizes, strides);
-  }
   SmallVector<OpFoldResult> sizes, strides;
-  for (unsigned d : transferLayout->logicalDims) {
+  for (unsigned d = 0; d < vi.rank; ++d) {
     sizes.push_back(b.getIndexAttr(vi.tile[d]));
     if (vi.strideStatic[d] == ShapedType::kDynamic)
       strides.push_back(vi.strideVal[d]);
@@ -221,9 +156,8 @@ static Value createGmTileView(OpBuilder &b, Location loc, const ViewData &vi,
       strides.push_back(b.getIndexAttr(vi.strideStatic[d]));
   }
   auto layout = StridedLayoutAttr::get(ctx, /*offset=*/ShapedType::kDynamic,
-                                       transferLayout->strideStatic);
-  auto gmTileTy =
-      MemRefType::get(transferLayout->shape, vi.elementType, layout);
+                                       vi.strideStatic);
+  auto gmTileTy = MemRefType::get(vi.tile, vi.elementType, layout);
   return b.create<memref::ReinterpretCastOp>(loc, gmTileTy, vi.base,
                                              OpFoldResult(off), sizes, strides);
 }
@@ -600,13 +534,6 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load,
     }
   }
 
-  std::optional<PhysicalTransferLayout> transferLayout;
-  if (!vi.isGatherScatter()) {
-    transferLayout = buildPhysicalTransferLayout(vi);
-    if (!transferLayout)
-      return failure();
-  }
-
   vi.base = materializeBase(b, loc, vi);
   Value accessInBounds =
       buildAccessInBoundsCondition(b, loc, vi, load.getIndices());
@@ -618,24 +545,15 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load,
           result = emitGatherAccess(nested, nestedLoc, vi, vi.base,
                                     load.getIndices(), vi.sparseDims, tensorTy);
         } else {
-          bool collapsed = transferLayout->collapses(vi.rank);
           auto localType = MemRefType::get(vi.tile, vi.elementType);
-          auto transferLocalType =
-              MemRefType::get(transferLayout->shape, vi.elementType);
-          Value buffer = nested.create<memref::AllocOp>(
-              nestedLoc, collapsed ? transferLocalType : localType);
+          Value buffer =
+              nested.create<memref::AllocOp>(nestedLoc, localType);
           Value offset =
               buildTileOriginOffset(nested, nestedLoc, vi, load.getIndices());
-          Value gm =
-              createGmTileView(nested, nestedLoc, vi, offset, &*transferLayout);
+          Value gm = createGmTileView(nested, nestedLoc, vi, offset);
           nested.create<memref::CopyOp>(nestedLoc, gm, buffer);
-
-          Value tensorBuffer = buffer;
-          if (collapsed)
-            tensorBuffer = nested.create<memref::ExpandShapeOp>(
-                nestedLoc, localType, buffer, transferLayout->reassociation);
           result = nested.create<bufferization::ToTensorOp>(
-              nestedLoc, tensorTy, tensorBuffer,
+              nestedLoc, tensorTy, buffer,
               /*restrict=*/true, /*writable=*/false);
         }
         nested.create<scf::YieldOp>(nestedLoc, result);
@@ -681,8 +599,7 @@ static LogicalResult lowerViewStore(tv::ViewStoreOp store,
         else {
           Value offset =
               buildTileOriginOffset(nested, nestedLoc, vi, store.getIndices());
-          Value gm = createGmTileView(nested, nestedLoc, vi, offset,
-                                      /*transferLayout=*/nullptr);
+          Value gm = createGmTileView(nested, nestedLoc, vi, offset);
           auto materialize =
               nested.create<bufferization::MaterializeInDestinationOp>(
                   nestedLoc, store.getValue(), gm);
