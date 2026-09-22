@@ -11,6 +11,7 @@
 #include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
@@ -160,7 +161,11 @@ FailureOr<Value> createTensorViewBase(OpBuilder &b, Location loc, Value basePtr,
 
   unsigned rank = shape.size();
   Type elementType = getPtrPointeeType(basePtr.getType());
-  SmallVector<int64_t> strideStatic(rank, ShapedType::kDynamic);
+  SmallVector<int64_t> strideStatic;
+  strideStatic.reserve(rank);
+  for (Value stride : strides)
+    strideStatic.push_back(
+        getConstantIntValue(stride).value_or(ShapedType::kDynamic));
   SmallVector<Value> strideDyn(strides.begin(), strides.end());
   SmallVector<Value> extent(shape.begin(), shape.end());
   return createBaseView(b, loc, basePtr, elementType, strideStatic, strideDyn,
