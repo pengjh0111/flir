@@ -14,6 +14,7 @@ add_triton_library(TensorViewLowering
   MLIRBufferizationDialect
   MLIRArithDialect
   MLIRFuncDialect
+  MLIRLinalgDialect
   MLIRSCFDialect
   MLIRTensorDialect
   TritonIR
