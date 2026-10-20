@@ -17,8 +17,11 @@
 #include "llvm/ADT/ArrayRef.h"
 
 namespace mlir {
+class DialectRegistry;
 namespace triton {
 namespace tv {
+
+void registerTritonPointerInterface(mlir::DialectRegistry &registry);
 
 // Pointee type of a `!tv.ptr<T>` or `!tt.ptr<T>`, or null otherwise.
 Type getPtrPointeeType(Type type);

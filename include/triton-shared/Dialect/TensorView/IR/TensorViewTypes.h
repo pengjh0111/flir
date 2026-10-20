@@ -13,6 +13,8 @@
 #include "mlir/IR/TypeSupport.h"
 #include "mlir/IR/Types.h"
 
+#include "triton-shared/Dialect/TensorView/IR/TensorViewTypeInterfaces.h.inc"
+
 #define GET_TYPEDEF_CLASSES
 #include "triton-shared/Dialect/TensorView/IR/TensorViewTypes.h.inc"
 

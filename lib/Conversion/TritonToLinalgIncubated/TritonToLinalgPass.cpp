@@ -35,6 +35,7 @@
 #include "incubated/Conversion/TritonToStructuredIncubated/CannonicalizerConverter.h"
 #include "incubated/Conversion/UtilsIncubated/InterleaveOptimization.h"
 #include "incubated/Conversion/UtilsIncubated/Utils.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 
 #if __has_include("bishengir/Dialect/HFusion/IR/HFusion.h")
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
@@ -452,13 +453,13 @@ void TritonToLinalgIncubatedPass::convertTTFunc(triton::FuncOp func,
 
 void TritonToLinalgIncubatedPass::addDynamicLegal(
     ConversionTarget &target, TritonTypeConverter &tritonTypeConverter) {
-  target.addLegalDialect<func::FuncDialect, arith::ArithDialect,
-                         math::MathDialect, linalg::LinalgDialect,
-                         affine::AffineDialect, scf::SCFDialect,
-                         cf::ControlFlowDialect, tensor::TensorDialect,
-                         LLVM::LLVMDialect, bufferization::BufferizationDialect,
-                         memref::MemRefDialect, annotation::AnnotationDialect,
-                         hivm::HIVMDialect, hfusion::HFusionDialect>();
+  target.addLegalDialect<
+      func::FuncDialect, arith::ArithDialect, math::MathDialect,
+      linalg::LinalgDialect, affine::AffineDialect, scf::SCFDialect,
+      cf::ControlFlowDialect, tensor::TensorDialect, LLVM::LLVMDialect,
+      bufferization::BufferizationDialect, memref::MemRefDialect,
+      annotation::AnnotationDialect, hivm::HIVMDialect, hfusion::HFusionDialect,
+      triton::tv::TensorViewDialect>();
 
   // add legal dialect on condition
   target.addLegalOp<ModuleOp>();
@@ -517,6 +518,8 @@ void TritonToLinalgIncubatedPass::addDynamicLegal(
       if (auto shapedType = dyn_cast<ShapedType>(t)) {
         return shapedType.getElementType().isIntOrFloat();
       }
+      if (isa<triton::tv::PtrType, triton::tv::TensorViewType>(t))
+        return true;
       assert(t.isIntOrIndexOrFloat());
       return true;
     });
@@ -812,6 +815,74 @@ TritonToLinalgIncubatedPass::processLegalStrideOperations(ModuleOp moduleOp) {
   return success();
 }
 
+// Pointer arithmetic is converted before the normal Triton conversion loses
+// its per-lane structure. Shape operations can then use ordinary i64 tensors.
+static FailureOr<Value>
+tensorViewPointerAddresses(Value value, OpBuilder &builder,
+                           DenseMap<Value, Value> &converted) {
+  if (auto found = converted.find(value); found != converted.end())
+    return found->second;
+  auto tensor = dyn_cast<RankedTensorType>(value.getType());
+  if (tensor && tensor.getElementType().isInteger(64))
+    return value;
+  Location loc = value.getLoc();
+  if (isa<triton::PointerType>(value.getType())) {
+    Value address =
+        builder.create<triton::PtrToIntOp>(loc, builder.getI64Type(), value);
+    converted[value] = address;
+    return address;
+  }
+  if (!tensor || !isa<triton::PointerType>(tensor.getElementType()))
+    return failure();
+  auto addressType = tensor.clone(builder.getI64Type());
+  Operation *producer = value.getDefiningOp();
+  if (auto add = dyn_cast_or_null<triton::AddPtrOp>(producer)) {
+    auto base = tensorViewPointerAddresses(add.getPtr(), builder, converted);
+    if (failed(base))
+      return failure();
+    Value offset = add.getOffset();
+    if (getElementTypeOrSelf(offset.getType()).getIntOrFloatBitWidth() < 64)
+      offset = builder.create<arith::ExtSIOp>(loc, addressType, offset);
+    auto pointee =
+        cast<triton::PointerType>(tensor.getElementType()).getPointeeType();
+    if (!pointee.isIntOrFloat())
+      return failure();
+    int64_t bytes = (pointee.getIntOrFloatBitWidth() + 7) / 8;
+    Value scale = builder.create<arith::ConstantOp>(
+        loc,
+        DenseElementsAttr::get(addressType, builder.getI64IntegerAttr(bytes)));
+    Value scaled = builder.create<arith::MulIOp>(loc, offset, scale);
+    Value address = builder.create<arith::AddIOp>(loc, *base, scaled);
+    converted[value] = address;
+    return address;
+  }
+  if (!isa_and_nonnull<triton::SplatOp, triton::BroadcastOp,
+                       triton::ExpandDimsOp, triton::TransOp, triton::ReshapeOp,
+                       triton::JoinOp, triton::SplitOp, triton::GatherOp,
+                       triton::BitcastOp, arith::SelectOp>(producer))
+    return failure();
+  IRMapping mapping;
+  for (Value operand : producer->getOperands()) {
+    Type element = getElementTypeOrSelf(operand.getType());
+    if (!isa<triton::PointerType>(element))
+      continue;
+    auto address = tensorViewPointerAddresses(operand, builder, converted);
+    if (failed(address))
+      return failure();
+    mapping.map(operand, *address);
+  }
+  Operation *clone = builder.clone(*producer, mapping);
+  for (auto [original, result] :
+       llvm::zip(producer->getResults(), clone->getResults())) {
+    auto type = dyn_cast<RankedTensorType>(original.getType());
+    if (type && isa<triton::PointerType>(type.getElementType())) {
+      result.setType(type.clone(builder.getI64Type()));
+      converted[original] = result;
+    }
+  }
+  return converted.lookup(value);
+}
+
 void TritonToLinalgIncubatedPass::runOnOperation() {
   compileOn91095Flag = this->compileOn91095;
 
@@ -888,6 +959,36 @@ void TritonToLinalgIncubatedPass::runOnOperation() {
     if (failed(runPipeline(pm, moduleOp))) {
       moduleOp->emitError(
           "failed to pre-clean dead control-flow before use analysis");
+      signalPassFailure();
+      return;
+    }
+  }
+
+  // Serialize pointer tensors as addresses, keeping tv.ptr accesses intact.
+  bool normalizedPointers = false;
+  WalkResult pointerAccesses = moduleOp.walk([&](Operation *op) {
+    if (!isa<triton::tv::PtrLoadOp, triton::tv::PtrStoreOp>(op))
+      return WalkResult::advance();
+    OpBuilder builder(op);
+    DenseMap<Value, Value> addresses;
+    auto converted =
+        tensorViewPointerAddresses(op->getOperand(0), builder, addresses);
+    if (failed(converted)) {
+      op->emitError(
+          "unsupported pointer-tensor producer for TensorView passthrough");
+      return WalkResult::interrupt();
+    }
+    normalizedPointers |= op->getOperand(0) != *converted;
+    op->setOperand(0, *converted);
+    return WalkResult::advance();
+  });
+  if (pointerAccesses.wasInterrupted()) {
+    signalPassFailure();
+    return;
+  }
+  if (normalizedPointers) {
+    RewritePatternSet pointerCleanup(&getContext());
+    if (failed(applyPatternsGreedily(moduleOp, std::move(pointerCleanup)))) {
       signalPassFailure();
       return;
     }

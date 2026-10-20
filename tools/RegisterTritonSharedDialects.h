@@ -6,8 +6,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Ptr/IR/PtrDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "triton-shared/Conversion/StructuredToMemref/Passes.h"
 #include "triton-shared/Conversion/ReconcilePtrCasts/Passes.h"
+#include "triton-shared/Conversion/StructuredToMemref/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "triton/Dialect/Triton/Transforms/Passes.h"
@@ -22,6 +22,7 @@
 #include "triton-shared/Conversion/TritonToUnstructured/Passes.h"
 #include "triton-shared/Conversion/UnstructuredToMemref/Passes.h"
 #include "triton-shared/Dialect/TPtr/IR/TPtrDialect.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewBuilder.h"
 #include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 #include "triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h"
@@ -70,6 +71,7 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
 
   // TODO: register Triton & TritonGPU passes
   registry.insert<mlir::triton::tv::TensorViewDialect>();
+  mlir::triton::tv::registerTritonPointerInterface(registry);
   registry.insert<
       mlir::tptr::TPtrDialect, mlir::ptr::PtrDialect,
       mlir::ttx::TritonTilingExtDialect, mlir::tts::TritonStructuredDialect,

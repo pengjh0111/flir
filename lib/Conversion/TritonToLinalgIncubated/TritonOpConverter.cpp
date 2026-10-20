@@ -2764,8 +2764,18 @@ PtrToIntConverter::matchAndRewrite(triton::PtrToIntOp op, OpAdaptor adaptor,
   auto ptrToIndexOp =
       rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, ptr);
 
+  // A converted scalar pointer may be a subview with a nonzero offset.
+  auto metadata = rewriter.create<memref::ExtractStridedMetadataOp>(loc, ptr);
+  auto pointee = cast<MemRefType>(ptr.getType()).getElementType();
+  int64_t bytes =
+      pointee.isIndex() ? 8 : (pointee.getIntOrFloatBitWidth() + 7) / 8;
+  Value scale = rewriter.create<arith::ConstantIndexOp>(loc, bytes);
+  Value offset =
+      rewriter.create<arith::MulIOp>(loc, metadata.getOffset(), scale);
+  Value address = rewriter.create<arith::AddIOp>(loc, ptrToIndexOp, offset);
+
   Value intResult =
-      rewriter.create<arith::IndexCastOp>(loc, resultType, ptrToIndexOp);
+      rewriter.create<arith::IndexCastOp>(loc, resultType, address);
 
   rewriter.replaceOp(op, intResult);
   return success();

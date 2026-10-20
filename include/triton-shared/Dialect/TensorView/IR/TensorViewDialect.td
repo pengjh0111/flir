@@ -24,10 +24,6 @@ def TensorView_Dialect : Dialect {
     tensor domain.  It is independent of and parallel to the TileIR dialect.
   }];
 
-  let dependentDialects = [
-    "triton::TritonDialect",
-  ];
-
   // `tv.ptr` / `tv.tensor_view` and the encoding attributes rely on the default
   // mnemonic-based dispatch for their assembly.
   let useDefaultTypePrinterParser = 1;

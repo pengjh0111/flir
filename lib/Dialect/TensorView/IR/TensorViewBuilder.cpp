@@ -108,6 +108,22 @@ namespace mlir {
 namespace triton {
 namespace tv {
 
+namespace {
+struct TritonPointerInterface
+    : TensorViewPointerTypeInterface::ExternalModel<TritonPointerInterface,
+                                                    triton::PointerType> {
+  Type getPointeeType(Type type) const {
+    return cast<triton::PointerType>(type).getPointeeType();
+  }
+};
+} // namespace
+
+void registerTritonPointerInterface(DialectRegistry &registry) {
+  registry.addExtension(+[](MLIRContext *context, triton::TritonDialect *) {
+    triton::PointerType::attachInterface<TritonPointerInterface>(*context);
+  });
+}
+
 Type getPtrPointeeType(Type type) {
   if (auto ptr = dyn_cast<tv::PtrType>(type))
     return ptr.getPointeeType();
@@ -173,8 +189,7 @@ FailureOr<Value> createTensorViewBase(OpBuilder &b, Location loc, Value basePtr,
 }
 
 Value createPartitionView(OpBuilder &b, Location loc, Value baseView,
-                          ArrayRef<int64_t> tile,
-                          PaddingValue paddingValue) {
+                          ArrayRef<int64_t> tile, PaddingValue paddingValue) {
   auto encoding =
       tv::PartitionViewAttr::get(b.getContext(), tile, paddingValue);
   auto resultType = getEncodedViewType(baseView, encoding);

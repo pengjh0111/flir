@@ -61,12 +61,7 @@ LogicalResult MakeTensorViewOp::verify() {
   if (static_cast<int64_t>(getStrides().size()) != rank)
     return emitOpError("expected ")
            << rank << " stride operands but got " << getStrides().size();
-  Type srcPointee;
-  if (auto tvPtrTy = dyn_cast<PtrType>(getSource().getType()))
-    srcPointee = tvPtrTy.getPointeeType();
-  else
-    srcPointee =
-        cast<triton::PointerType>(getSource().getType()).getPointeeType();
+  Type srcPointee = cast<PtrType>(getSource().getType()).getPointeeType();
   if (resTy.getElementType() != srcPointee)
     return emitOpError("result element type must match source pointee type");
   return success();
@@ -265,9 +260,9 @@ static LogicalResult verifyPointerCoordinates(Operation *op,
 LogicalResult PtrLoadOp::verify() {
   auto pointersType = cast<RankedTensorType>(getPointers().getType());
   auto pointerType =
-      dyn_cast<triton::PointerType>(pointersType.getElementType());
-  if (!pointerType)
-    return emitOpError("pointers must be a tensor of tt.ptr elements");
+      dyn_cast<TensorViewPointerTypeInterface>(pointersType.getElementType());
+  if (!pointerType && !pointersType.getElementType().isInteger(64))
+    return emitOpError("pointers must contain pointer or i64 address elements");
   int64_t len = ShapedType::kDynamic;
   if (failed(verifyPointerCoordinates(*this, pointersType, getIndices(), len)))
     return failure();
@@ -277,7 +272,7 @@ LogicalResult PtrLoadOp::verify() {
   if (!ShapedType::isDynamic(len) &&
       !ShapedType::isDynamic(resTy.getShape()[0]) && resTy.getShape()[0] != len)
     return emitOpError("result length must match the coordinate length");
-  if (resTy.getElementType() != pointerType.getPointeeType())
+  if (pointerType && resTy.getElementType() != pointerType.getPointeeType())
     return emitOpError(
         "result element type must match the pointer pointee type");
   return success();
@@ -286,9 +281,9 @@ LogicalResult PtrLoadOp::verify() {
 LogicalResult PtrStoreOp::verify() {
   auto pointersType = cast<RankedTensorType>(getPointers().getType());
   auto pointerType =
-      dyn_cast<triton::PointerType>(pointersType.getElementType());
-  if (!pointerType)
-    return emitOpError("pointers must be a tensor of tt.ptr elements");
+      dyn_cast<TensorViewPointerTypeInterface>(pointersType.getElementType());
+  if (!pointerType && !pointersType.getElementType().isInteger(64))
+    return emitOpError("pointers must contain pointer or i64 address elements");
   int64_t len = ShapedType::kDynamic;
   if (failed(verifyPointerCoordinates(*this, pointersType, getIndices(), len)))
     return failure();
@@ -298,8 +293,51 @@ LogicalResult PtrStoreOp::verify() {
   if (!ShapedType::isDynamic(len) &&
       !ShapedType::isDynamic(valTy.getShape()[0]) && valTy.getShape()[0] != len)
     return emitOpError("value length must match the coordinate length");
-  if (valTy.getElementType() != pointerType.getPointeeType())
+  if (pointerType && valTy.getElementType() != pointerType.getPointeeType())
     return emitOpError(
         "value element type must match the pointer pointee type");
   return success();
+}
+
+// Bufferization changes the data and sparse-coordinate operands, while the
+// view type continues to carry all logical access information.
+static LogicalResult verifyBufferAccess(Operation *op, Value view, Value buffer,
+                                        ValueRange indices) {
+  auto type = cast<TensorViewType>(view.getType());
+  Attribute encoding = type.getEncoding();
+  if (!isViewEncoding(encoding))
+    return op->emitOpError("expected an encoded view");
+  auto bufferType = cast<MemRefType>(buffer.getType());
+  if (bufferType.getShape() !=
+          ArrayRef<int64_t>(getEncodingTileShape(encoding)) ||
+      bufferType.getElementType() != type.getElementType())
+    return op->emitOpError("buffer type must match the view tile");
+  if (indices.size() !=
+      static_cast<size_t>(getEncodingIndexSpaceRank(encoding)))
+    return op->emitOpError("index count must match the view index-space rank");
+  auto sparse = getEncodingSparseDims(encoding);
+  auto tile = getEncodingTileShape(encoding);
+  for (auto [dim, index] : llvm::enumerate(indices)) {
+    if (!llvm::is_contained(sparse, dim)) {
+      if (!index.getType().isIndex())
+        return op->emitOpError("regular coordinates must be scalar indices");
+      continue;
+    }
+    auto indexType = dyn_cast<MemRefType>(index.getType());
+    if (!indexType || indexType.getRank() != 1 ||
+        (!indexType.isDynamicDim(0) && indexType.getDimSize(0) != tile[dim]) ||
+        !(indexType.getElementType().isIndex() ||
+          indexType.getElementType().isInteger(32) ||
+          indexType.getElementType().isInteger(64)))
+      return op->emitOpError("sparse coordinates must be rank-1 index/i32/i64 "
+                             "buffers matching the tile");
+  }
+  return success();
+}
+
+LogicalResult ViewLoadIntoOp::verify() {
+  return verifyBufferAccess(*this, getView(), getBuffer(), getIndices());
+}
+LogicalResult ViewStoreFromOp::verify() {
+  return verifyBufferAccess(*this, getView(), getBuffer(), getIndices());
 }

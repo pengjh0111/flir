@@ -13,15 +13,16 @@
 #ifndef TRITON_DIALECT_TENSORVIEW_DIALECT_H
 #define TRITON_DIALECT_TENSORVIEW_DIALECT_H
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
-#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 
 #include "triton-shared/Dialect/TensorView/IR/TensorViewAttrs.h"
-#include "triton-shared/Dialect/TensorView/IR/TensorViewTypes.h"
 #include "triton-shared/Dialect/TensorView/IR/TensorViewInterfaces.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewTypes.h"
 
 #include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h.inc"
 

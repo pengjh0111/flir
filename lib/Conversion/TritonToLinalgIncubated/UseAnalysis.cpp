@@ -26,6 +26,7 @@
 #if __has_include("bishengir/Dialect/HIVM/IR/HIVM.h")
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #endif
+#include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #ifdef __TLE_STRUCT__
 #include "tle/dialect/include/IR/Dialect.h"
@@ -78,6 +79,18 @@ void triton::UseAnalysis::visitOperation(Operation *op,
   }
 
   TypeSwitch<Operation *>(op)
+      .Case<triton::tv::ViewLoadOp, triton::tv::PtrLoadOp>([&](auto load) {
+        for (auto [operand, use] : llvm::zip(load->getOperands(), operands))
+          propagateUse(use, isa<RankedTensorType>(operand.getType())
+                                ? UseType::DataUse
+                                : UseType::MetaUse);
+      })
+      .Case<triton::tv::ViewStoreOp, triton::tv::PtrStoreOp>([&](auto store) {
+        for (auto [operand, use] : llvm::zip(store->getOperands(), operands))
+          propagateUse(use, isa<RankedTensorType>(operand.getType())
+                                ? UseType::DataUse
+                                : UseType::MetaUse);
+      })
       .Case<triton::LoadOp>([&](auto load) {
         propagateUse(operands[0], UseType::MetaUse);
         auto mask = load.getMask();

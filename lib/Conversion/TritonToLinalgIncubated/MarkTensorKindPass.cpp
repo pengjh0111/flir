@@ -22,6 +22,7 @@
 
 #include "incubated/Conversion/TritonToLinalgIncubated/MarkTensorKindPass.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
+#include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -110,7 +111,7 @@ static void addTensorKindToArguments(OpTy op, TensorKind tensorKind) {
       if (auto func = dyn_cast_or_null<triton::FuncOp>(
               blockArg.getOwner()->getParentOp())) {
         if (blockArg.getOwner() == &func.getBody().front() &&
-            isa<triton::PointerType>(blockArg.getType())) {
+            isa<triton::PointerType, triton::tv::PtrType>(blockArg.getType())) {
           setBlockArgumentAttr(blockArg, func, tensorKind);
           break;
         }
@@ -141,6 +142,8 @@ void MarkTensorKindPass::runOnOperation() {
   // INPUT tensors
   patterns.add<
       MarkTensorKindPattern<TensorKind::INPUT, triton::LoadOp>,
+      MarkTensorKindPattern<TensorKind::INPUT, triton::tv::ViewLoadOp>,
+      MarkTensorKindPattern<TensorKind::INPUT, triton::tv::PtrLoadOp>,
       MarkTensorKindPattern<TensorKind::INPUT,
                             triton::ascend::IndexSelectSimdOp>,
       MarkTensorKindPattern<TensorKind::INPUT, triton::ascend::GatherOutToUbOp>,
@@ -150,6 +153,8 @@ void MarkTensorKindPass::runOnOperation() {
   // OUTPUT tensors
   patterns.add<
       MarkTensorKindPattern<TensorKind::OUTPUT, triton::StoreOp>,
+      MarkTensorKindPattern<TensorKind::OUTPUT, triton::tv::ViewStoreOp>,
+      MarkTensorKindPattern<TensorKind::OUTPUT, triton::tv::PtrStoreOp>,
       MarkTensorKindPattern<TensorKind::OUTPUT, triton::ascend::IndexPutOp>,
       MarkTensorKindPattern<TensorKind::OUTPUT,
                             triton::ascend::ScatterUbToOutOp>,

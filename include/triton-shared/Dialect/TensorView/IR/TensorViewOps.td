@@ -16,7 +16,7 @@ include "triton-shared/Dialect/TensorView/IR/TensorViewInterfaces.td"
 
 include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
-include "triton/Dialect/Triton/IR/TritonTypes.td"
+include "mlir/Interfaces/DestinationStyleOpInterface.td"
 
 class TensorView_Op<string mnemonic, list<Trait> traits = []>
     : Op<TensorView_Dialect, mnemonic, traits>;
@@ -147,6 +147,54 @@ def TV_PtrStoreOp : TensorView_Op<"ptr_store",
   let assemblyFormat = [{
     $pointers `,` $value `,` `indices` `=` `[` $indices `]`
     attr-dict `:` type($pointers) `,` type($value) `,` type($indices)
+  }];
+}
+
+// Buffer forms retain the view chain until backend library-call lowering.
+class TV_BufferAccessOp<string mnemonic> : TensorView_Op<mnemonic,
+    [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>]> {
+  let hasVerifier = 1;
+  let arguments = (ins TV_TensorViewType:$view, AnyMemRef:$buffer,
+    Variadic<AnyTypeOf<[Index, AnyMemRef]>>:$indices);
+  let extraClassDeclaration = [{
+    ::mlir::MutableOperandRange getDpsInitsMutable() {
+      return getBufferMutable();
+    }
+  }];
+  let assemblyFormat = [{
+    $view `[` $indices `]` `,` $buffer attr-dict `:` qualified(type($view))
+    `,` type($buffer) `,` type($indices)
+  }];
+}
+def TV_ViewLoadIntoOp : TV_BufferAccessOp<"view_load_into">;
+def TV_ViewStoreFromOp : TV_BufferAccessOp<"view_store_from"> {
+  let extraClassDeclaration = [{
+    ::mlir::MutableOperandRange getDpsInitsMutable() {
+      return ::mlir::MutableOperandRange(getOperation(), 0, 0);
+    }
+  }];
+}
+
+class TV_BufferPtrAccessOp<string mnemonic> : TensorView_Op<mnemonic,
+    [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>]> {
+  let arguments = (ins AnyMemRef:$pointers, AnyMemRef:$buffer,
+                        Variadic<AnyMemRef>:$indices);
+  let extraClassDeclaration = [{
+    ::mlir::MutableOperandRange getDpsInitsMutable() {
+      return getBufferMutable();
+    }
+  }];
+  let assemblyFormat = [{
+    $pointers `[` $indices `]` `,` $buffer attr-dict `:` type($pointers)
+    `,` type($buffer) `,` type($indices)
+  }];
+}
+def TV_PtrLoadIntoOp : TV_BufferPtrAccessOp<"ptr_load_into">;
+def TV_PtrStoreFromOp : TV_BufferPtrAccessOp<"ptr_store_from"> {
+  let extraClassDeclaration = [{
+    ::mlir::MutableOperandRange getDpsInitsMutable() {
+      return ::mlir::MutableOperandRange(getOperation(), 0, 0);
+    }
   }];
 }
 

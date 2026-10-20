@@ -20,6 +20,8 @@
 using namespace mlir;
 using namespace mlir::triton::tv;
 
+#include "triton-shared/Dialect/TensorView/IR/TensorViewTypeInterfaces.cpp.inc"
+
 #define GET_TYPEDEF_CLASSES
 #include "triton-shared/Dialect/TensorView/IR/TensorViewTypes.cpp.inc"
 

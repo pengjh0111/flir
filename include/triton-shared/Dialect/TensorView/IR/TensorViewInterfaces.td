@@ -64,4 +64,10 @@ def ViewOpInterface : OpInterface<"ViewOpInterface"> {
   ];
 }
 
+def TensorViewPointerTypeInterface : TypeInterface<"TensorViewPointerTypeInterface"> {
+  let cppNamespace = "::mlir::triton::tv";
+  let methods = [InterfaceMethod<"Return the pointee type.", "::mlir::Type",
+                                 "getPointeeType">];
+}
+
 #endif // TENSORVIEW_INTERFACES

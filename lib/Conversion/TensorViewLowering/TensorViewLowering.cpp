@@ -843,6 +843,7 @@ static LogicalResult lowerPtrLoad(tv::PtrLoadOp op, PatternRewriter &rewriter) {
   Value pointers = op.getPointers();
   auto pointersType = dyn_cast<RankedTensorType>(pointers.getType());
   if (!pointersType ||
+      !isa<triton::PointerType>(pointersType.getElementType()) ||
       op.getIndices().size() != static_cast<size_t>(pointersType.getRank()))
     return failure();
   auto resTy = cast<RankedTensorType>(op.getResult().getType());
@@ -889,6 +890,7 @@ static LogicalResult lowerPtrStore(tv::PtrStoreOp op,
   Value pointers = op.getPointers();
   auto pointersType = dyn_cast<RankedTensorType>(pointers.getType());
   if (!pointersType ||
+      !isa<triton::PointerType>(pointersType.getElementType()) ||
       op.getIndices().size() != static_cast<size_t>(pointersType.getRank()))
     return failure();
   Value value = op.getValue();

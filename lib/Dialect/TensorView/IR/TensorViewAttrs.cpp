@@ -15,6 +15,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h" // required by `Attrs.cpp.inc`
+#include "llvm/Config/llvm-config.h"
 
 using namespace mlir;
 using namespace mlir::triton::tv;
@@ -64,31 +65,34 @@ static void printIntArray(AsmPrinter &printer, StringRef keyword,
 static ParseResult parsePaddingValue(AsmParser &parser, PaddingValue &value) {
   if (parser.parseKeyword("padding_value") || parser.parseEqual())
     return failure();
-  if (succeeded(parser.parseOptionalKeyword("zero"))) {
-    value = PaddingValue::ZERO;
-    return success();
+  std::string spelling;
+  if (succeeded(parser.parseOptionalKeywordOrString(&spelling))) {
+    if (auto padding = symbolizePaddingValue(spelling)) {
+      value = *padding;
+      return success();
+    }
+    return parser.emitError(parser.getCurrentLocation(),
+                            "expected zero, nan, inf, or -inf");
   }
-  if (succeeded(parser.parseOptionalKeyword("nan"))) {
-    value = PaddingValue::NAN_VALUE;
-    return success();
-  }
-  if (succeeded(parser.parseOptionalKeyword("inf"))) {
-    value = PaddingValue::POS_INF;
-    return success();
-  }
+#if LLVM_VERSION_MAJOR >= 20
   if (succeeded(parser.parseOptionalMinus())) {
     if (parser.parseKeyword("inf"))
       return failure();
     value = PaddingValue::NEG_INF;
     return success();
   }
+#endif
   return parser.emitError(parser.getCurrentLocation(),
                           "expected zero, nan, inf, or -inf");
 }
 
 static void printPaddingValue(AsmPrinter &printer, PaddingValue value) {
   printer << "padding_value = ";
-  printer << stringifyPaddingValue(value);
+  // LLVM 19 cannot parse a standalone minus token in dialect assembly.
+  if (value == PaddingValue::NEG_INF)
+    printer << "\"-inf\"";
+  else
+    printer << stringifyPaddingValue(value);
 }
 
 //===----------------------------------------------------------------------===//

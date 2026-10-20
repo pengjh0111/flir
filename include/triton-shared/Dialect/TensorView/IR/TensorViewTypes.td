@@ -14,6 +14,7 @@ include "triton-shared/Dialect/TensorView/IR/TensorViewDialect.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/BuiltinTypeInterfaces.td"
 include "mlir/IR/CommonTypeConstraints.td"
+include "triton-shared/Dialect/TensorView/IR/TensorViewInterfaces.td"
 
 class TensorView_Type<string name, string typeMnemonic, list<Trait> traits = []>
     : TypeDef<TensorView_Dialect, name, traits> {
@@ -23,7 +24,7 @@ class TensorView_Type<string name, string typeMnemonic, list<Trait> traits = []>
 //===----------------------------------------------------------------------===//
 // tv.ptr : global pointer, replaces !tt.ptr as function inputs.
 //===----------------------------------------------------------------------===//
-def TV_PtrType : TensorView_Type<"Ptr", "ptr"> {
+def TV_PtrType : TensorView_Type<"Ptr", "ptr", [TensorViewPointerTypeInterface]> {
   let summary = "TensorView global pointer type (`!tv.ptr<T>`).";
   let parameters = (ins "Type":$pointeeType);
   let assemblyFormat = "`<` $pointeeType `>`";

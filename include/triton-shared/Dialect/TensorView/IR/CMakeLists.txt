@@ -1,3 +1,7 @@
+if(TARGET TensorViewTableGen)
+  return()
+endif()
+
 set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
 
 set(LLVM_TARGET_DEFINITIONS TensorViewOps.td)
@@ -25,3 +29,7 @@ set(LLVM_TARGET_DEFINITIONS TensorViewInterfaces.td)
 mlir_tablegen(TensorViewInterfaces.h.inc -gen-op-interface-decls)
 mlir_tablegen(TensorViewInterfaces.cpp.inc -gen-op-interface-defs)
 add_public_tablegen_target(TensorViewInterfacesIncGen)
+
+mlir_tablegen(TensorViewTypeInterfaces.h.inc -gen-type-interface-decls)
+mlir_tablegen(TensorViewTypeInterfaces.cpp.inc -gen-type-interface-defs)
+add_public_tablegen_target(TensorViewTypeInterfacesIncGen)
