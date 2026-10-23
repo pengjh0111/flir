@@ -15,17 +15,18 @@ def TensorViewLowering : Pass<"tensor-view-lowering", "mlir::ModuleOp"> {
   let summary = "Lower TensorView access ops to generic IR";
   let description = [{
     GENERIC lowering variant: lowers the TensorView access ops to *community*
-    memref/bufferization/scf/tensor ops and scalar Triton memory accesses (no
-    HIVM dialect), mirroring the native tt->linalg access form so the backend
-    does placement + DMA lowering:
+    linalg/memref/bufferization/scf/tensor ops and scalar Triton memory accesses
+    (no HIVM dialect), mirroring the native tt->linalg access form so the
+    backend does placement + DMA lowering:
       - `!tv.ptr<T>` function inputs -> plain `memref<?xT>`
       - in-bounds `tv.view_load` -> reinterpret_cast + alloc + memref.copy +
                                     to_tensor
       - in-bounds `tv.view_store` -> reinterpret_cast +
                                      materialize_in_destination
-      - boundary view accesses -> scalar bounds checks with view padding
-      - gather/scatter view -> scalar scf.for over the tile (reinterpret sizes:[1]
-                               + memref.load / materialize_in_destination)
+      - boundary loads -> padding fill + clipped physical block copies
+      - boundary stores -> clipped physical block copies
+      - gather/scatter view -> block transfer over non-sparse dimensions,
+                               scalar access when no regular block remains
       - ptr_load/ptr_store -> scalar scf.for with scalar tt.load/tt.store
   }];
   let constructor = "triton::createTensorViewLoweringPass()";
@@ -34,6 +35,7 @@ def TensorViewLowering : Pass<"tensor-view-lowering", "mlir::ModuleOp"> {
     "mlir::memref::MemRefDialect",
     "mlir::bufferization::BufferizationDialect",
     "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
     "mlir::scf::SCFDialect",
     "mlir::tensor::TensorDialect",
     "mlir::triton::TritonDialect"];
