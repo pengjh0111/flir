@@ -7,8 +7,9 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Lower TensorView operations to portable memref, bufferization, scf, and
-// tensor operations. Address spaces and DMA selection remain backend concerns.
+// Lower TensorView operations to portable linalg, memref, bufferization, scf,
+// and tensor operations. Address spaces and DMA selection remain backend
+// concerns.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,10 +20,12 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -33,9 +36,9 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
-#include <optional>
 #include <utility>
 
 namespace mlir {
@@ -146,84 +149,53 @@ static Value materializeBase(OpBuilder &builder, Location loc,
       .getResult(0);
 }
 
-/// Physical layout of one GM-to-local transfer. The logical view keeps every
-/// dimension, while unit tile dimensions contribute only to the scalar origin
-/// offset and do not need to increase the DMA rank.
-struct PhysicalTransferLayout {
-  SmallVector<unsigned> logicalDims;
-  SmallVector<int64_t> shape;
-  SmallVector<int64_t> strideStatic;
-  SmallVector<ReassociationIndices> reassociation;
-
-  bool collapses(unsigned logicalRank) const {
-    return logicalDims.size() != logicalRank;
-  }
-};
-
-static std::optional<PhysicalTransferLayout>
-buildPhysicalTransferLayout(const ViewData &view) {
-  PhysicalTransferLayout layout;
+static SmallVector<unsigned> getNonSparseDims(const ViewData &view) {
+  SmallVector<unsigned> nonSparseDims;
   for (unsigned d = 0; d < view.rank; ++d) {
-    if (view.tile[d] == 1)
-      continue;
-    layout.logicalDims.push_back(d);
-    layout.shape.push_back(view.tile[d]);
-    layout.strideStatic.push_back(view.strideStatic[d]);
+    if (!llvm::is_contained(view.sparseDims, static_cast<int64_t>(d)))
+      nonSparseDims.push_back(d);
   }
-
-  // Keep transfers at least rank one even when the logical tile is all-unit.
-  if (layout.logicalDims.empty() && view.rank != 0) {
-    unsigned d = view.rank - 1;
-    layout.logicalDims.push_back(d);
-    layout.shape.push_back(view.tile[d]);
-    layout.strideStatic.push_back(view.strideStatic[d]);
-  }
-
-  if (!layout.collapses(view.rank))
-    return layout;
-
-  auto reassociation =
-      getReassociationIndicesForCollapse(view.tile, layout.shape);
-  if (!reassociation)
-    return std::nullopt;
-  layout.reassociation = std::move(*reassociation);
-  return layout;
+  return nonSparseDims;
 }
 
-/// Reinterpret the base as a GM tile. `transferLayout` selects a physical DMA
-/// rank distinct from the logical view rank; a null layout preserves the full
-/// logical tile shape.
-static Value createGmTileView(OpBuilder &b, Location loc, const ViewData &vi,
-                              Value off,
-                              const PhysicalTransferLayout *transferLayout) {
-  MLIRContext *ctx = b.getContext();
-  if (!transferLayout) {
-    SmallVector<OpFoldResult> sizes, strides;
-    for (unsigned d = 0; d < vi.rank; ++d) {
-      sizes.push_back(b.getIndexAttr(vi.tile[d]));
-      if (vi.strideStatic[d] == ShapedType::kDynamic)
-        strides.push_back(vi.strideVal[d]);
-      else
-        strides.push_back(b.getIndexAttr(vi.strideStatic[d]));
-    }
-    auto layout = StridedLayoutAttr::get(ctx, /*offset=*/ShapedType::kDynamic,
-                                         vi.strideStatic);
-    auto gmTileTy = MemRefType::get(vi.tile, vi.elementType, layout);
-    return b.create<memref::ReinterpretCastOp>(
-        loc, gmTileTy, vi.base, OpFoldResult(off), sizes, strides);
+static bool canUseBlockAccess(const ViewData &view,
+                              ArrayRef<unsigned> nonSparseDims) {
+  if (!view.isGatherScatter())
+    return view.rank != 0;
+  return llvm::any_of(nonSparseDims,
+                      [&](unsigned d) { return view.tile[d] != 1; });
+}
+
+/// Drop unit dimensions when constructing a dense block buffer or tensor.
+static SmallVector<int64_t> getBlockShape(ArrayRef<int64_t> tile) {
+  SmallVector<int64_t> shape;
+  for (int64_t size : tile) {
+    if (size != 1)
+      shape.push_back(size);
   }
+  if (shape.empty())
+    shape.push_back(1);
+  return shape;
+}
+
+/// Reinterpret the GM base using the selected view dimensions.
+static Value createGmTileView(OpBuilder &b, Location loc, const ViewData &vi,
+                              Value off, ArrayRef<unsigned> dims) {
+  SmallVector<int64_t> shape, strideStatic;
   SmallVector<OpFoldResult> sizes, strides;
-  for (unsigned d : transferLayout->logicalDims) {
+  for (unsigned d : dims) {
+    shape.push_back(vi.tile[d]);
+    strideStatic.push_back(vi.strideStatic[d]);
     sizes.push_back(b.getIndexAttr(vi.tile[d]));
     if (vi.strideStatic[d] == ShapedType::kDynamic)
       strides.push_back(vi.strideVal[d]);
     else
       strides.push_back(b.getIndexAttr(vi.strideStatic[d]));
   }
-  auto layout = StridedLayoutAttr::get(ctx, /*offset=*/ShapedType::kDynamic,
-                                       transferLayout->strideStatic);
-  auto gmTileTy =
-      MemRefType::get(transferLayout->shape, vi.elementType, layout);
+  auto layout = StridedLayoutAttr::get(b.getContext(),
+                                       /*offset=*/ShapedType::kDynamic,
+                                       strideStatic);
+  auto gmTileTy = MemRefType::get(shape, vi.elementType, layout);
   return b.create<memref::ReinterpretCastOp>(loc, gmTileTy, vi.base,
                                              OpFoldResult(off), sizes, strides);
 }
@@ -362,120 +334,225 @@ static Value createDiscreteGmElementView(OpBuilder &b, Location loc, Value base,
       ArrayRef<OpFoldResult>{b.getIndexAttr(1)});
 }
 
-/// Compute the contiguous block geometry for one sparse index.
-static void
-buildContiguousBlockGeometry(OpBuilder &b, Location loc, const ViewData &vi,
-                             ValueRange indices, unsigned sparseDim,
-                             Value sparseIndex, Value &offset,
-                             SmallVectorImpl<OpFoldResult> &sizes,
-                             SmallVectorImpl<OpFoldResult> &strides,
-                             SmallVectorImpl<OpFoldResult> &subviewOffsets) {
+/// GM offset and local window for one block load or store.
+struct BlockAccessInfo {
+  Value gmOffset; // Element offset from the flat GM base.
+  SmallVector<OpFoldResult> sizes; // Extents along non-sparse dimensions.
+  SmallVector<OpFoldResult> localOffsets; // Offsets along non-sparse dimensions.
+  Value hasElements; // Nonempty boundary intersection, if checked.
+};
+
+static BlockAccessInfo buildBlockAccessInfo(
+    OpBuilder &b, Location loc, const ViewData &vi, ValueRange indices,
+    ArrayRef<Value> sparseCoordinates, bool boundary) {
+  BlockAccessInfo access;
+  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  if (boundary)
+    access.hasElements = b.create<arith::ConstantIntOp>(loc, 1, 1);
+
   for (unsigned d = 0; d < vi.rank; ++d) {
-    int64_t blk = (d == sparseDim) ? 1 : vi.tile[d];
-    Value logical =
-        d == sparseDim ? sparseIndex
-                       : b.create<arith::MulIOp>(
-                             loc, indices[d],
-                             b.create<arith::ConstantIndexOp>(loc, vi.tile[d]));
-    Value phys = b.create<arith::MulIOp>(loc, logical, vi.strideVal[d]);
-    offset = offset ? b.create<arith::AddIOp>(loc, offset, phys) : phys;
-    sizes.push_back(b.getIndexAttr(blk));
-    strides.push_back(vi.strideStatic[d] == ShapedType::kDynamic
-                          ? OpFoldResult(vi.strideVal[d])
-                          : OpFoldResult(b.getIndexAttr(vi.strideStatic[d])));
-    subviewOffsets.push_back(
-        b.getIndexAttr(0)); // sparse offset overwritten by caller
+    bool sparse = static_cast<bool>(sparseCoordinates[d]);
+    Value origin;
+    int64_t blockSize;
+    if (sparse) {
+      auto extracted = b.create<tensor::ExtractOp>(
+          loc, indices[d], ValueRange{sparseCoordinates[d]});
+      extracted->setAttr("DiscreteMemAccess", b.getUnitAttr());
+      origin = asIndex(b, loc, extracted.getResult());
+      blockSize = 1;
+    } else {
+      Value traversal = b.create<arith::ConstantIndexOp>(loc, vi.traversal[d]);
+      origin = b.create<arith::MulIOp>(loc, indices[d], traversal);
+      blockSize = vi.tile[d];
+    }
+
+    Value begin = origin;
+    OpFoldResult size = b.getIndexAttr(blockSize);
+    OpFoldResult localOffset = b.getIndexAttr(0);
+    if (boundary) {
+      Value block = b.create<arith::ConstantIndexOp>(loc, blockSize);
+      begin = b.create<arith::MinSIOp>(
+          loc, b.create<arith::MaxSIOp>(loc, origin, zero), vi.sizeVal[d]);
+      Value end = b.create<arith::MinSIOp>(
+          loc, b.create<arith::AddIOp>(loc, origin, block), vi.sizeVal[d]);
+      Value clippedSize = b.create<arith::MaxSIOp>(
+          loc, b.create<arith::SubIOp>(loc, end, begin), zero);
+      Value dimensionHasElements = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::sgt, clippedSize, zero);
+      access.hasElements = b.create<arith::AndIOp>(
+          loc, access.hasElements, dimensionHasElements);
+      size = clippedSize;
+      Value offset = b.create<arith::MaxSIOp>(
+          loc, b.create<arith::SubIOp>(loc, begin, origin), zero);
+      localOffset = b.create<arith::MinSIOp>(loc, offset, block).getResult();
+    }
+
+    Value physical = b.create<arith::MulIOp>(loc, begin, vi.strideVal[d]);
+    access.gmOffset =
+        access.gmOffset
+            ? b.create<arith::AddIOp>(loc, access.gmOffset, physical)
+            : physical;
+
+    if (!sparse) {
+      access.sizes.push_back(size);
+      access.localOffsets.push_back(localOffset);
+    }
   }
+  return access;
 }
 
-/// Gather contiguous blocks along one sparse dimension.
-static Value emitContiguousGather(OpBuilder &b, Location loc,
-                                  const ViewData &vi, Value base,
-                                  ValueRange indices, unsigned sparseDim,
-                                  RankedTensorType resultType) {
-  auto bufTy = MemRefType::get(vi.tile, vi.elementType);
-  Value buf = b.create<memref::AllocOp>(loc, bufTy);
-  SmallVector<int64_t> blk(vi.tile.begin(), vi.tile.end());
-  blk[sparseDim] = 1;
-  auto layout = StridedLayoutAttr::get(b.getContext(), ShapedType::kDynamic,
-                                       vi.strideStatic);
-  auto gmBlkTy = MemRefType::get(blk, vi.elementType, layout);
-
-  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
-  Value upper = b.create<arith::ConstantIndexOp>(loc, vi.tile[sparseDim]);
-  auto loop = b.create<scf::ForOp>(loc, c0, upper, c1);
-  {
-    OpBuilder::InsertionGuard g(b);
+/// Emit nested sparse-coordinate loops around emitBody.
+/// Pseudo IR for a rank-3 view with sparseDims = [0, 2]:
+///   scf.for %i = %c0 to %tile0 step %c1 {
+///     scf.for %j = %c0 to %tile2 step %c1 {
+///       emitBody([%i, null, %j])
+///     }
+///   }
+static void
+emitSparseCoordinateLoops(OpBuilder &b, Location loc, const ViewData &vi,
+                          llvm::function_ref<void(ArrayRef<Value>)> emitBody) {
+  OpBuilder::InsertionGuard guard(b);
+  SmallVector<Value> coordinates(vi.rank);
+  for (int64_t dim : vi.sparseDims) {
+    Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+    Value one = b.create<arith::ConstantIndexOp>(loc, 1);
+    Value upper = b.create<arith::ConstantIndexOp>(loc, vi.tile[dim]);
+    auto loop = b.create<scf::ForOp>(loc, zero, upper, one);
     b.setInsertionPointToStart(loop.getBody());
-    Value k = loop.getInductionVar();
-    auto ext =
-        b.create<tensor::ExtractOp>(loc, indices[sparseDim], ValueRange{k});
-    ext->setAttr("DiscreteMemAccess", b.getUnitAttr());
-    Value sIdx = asIndex(b, loc, ext.getResult());
-
-    Value off;
-    SmallVector<OpFoldResult> sizes, strides, subOffs;
-    buildContiguousBlockGeometry(b, loc, vi, indices, sparseDim, sIdx, off,
-                                 sizes, strides, subOffs);
-    subOffs[sparseDim] = OpFoldResult(k);
-    SmallVector<OpFoldResult> subStr(vi.rank, b.getIndexAttr(1));
-    Value gm = b.create<memref::ReinterpretCastOp>(
-        loc, gmBlkTy, base, OpFoldResult(off), sizes, strides);
-    Value sub = b.create<memref::SubViewOp>(loc, buf, subOffs, sizes, subStr);
-    b.create<memref::CopyOp>(loc, gm, sub);
+    coordinates[dim] = loop.getInductionVar();
   }
-  loop->setAttr("ExtractedLoadOrStore", b.getUnitAttr());
-  return b.create<bufferization::ToTensorOp>(loc, resultType, buf,
-                                             /*restrict=*/true,
-                                             /*writable=*/false);
+  emitBody(coordinates);
 }
 
-/// Scatter contiguous blocks along one sparse dimension.
-static void emitContiguousScatter(OpBuilder &b, Location loc,
-                                  const ViewData &vi, Value base, Value value,
-                                  ValueRange indices, unsigned sparseDim) {
-  SmallVector<int64_t> blk(vi.tile.begin(), vi.tile.end());
-  blk[sparseDim] = 1;
-  auto layout = StridedLayoutAttr::get(b.getContext(), ShapedType::kDynamic,
-                                       vi.strideStatic);
-  auto gmBlkTy = MemRefType::get(blk, vi.elementType, layout);
+static void emitBlockCopy(OpBuilder &b, Location loc, const ViewData &vi,
+                          Value localValue, ValueRange indices,
+                          ArrayRef<Value> sparseCoordinates,
+                          ArrayRef<unsigned> nonSparseDims, bool boundary,
+                          bool store) {
+  BlockAccessInfo access =
+      buildBlockAccessInfo(b, loc, vi, indices, sparseCoordinates, boundary);
 
-  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
-  Value upper = b.create<arith::ConstantIndexOp>(loc, vi.tile[sparseDim]);
-  auto loop = b.create<scf::ForOp>(loc, c0, upper, c1);
-  {
-    OpBuilder::InsertionGuard g(b);
-    b.setInsertionPointToStart(loop.getBody());
-    Value k = loop.getInductionVar();
-    auto ext =
-        b.create<tensor::ExtractOp>(loc, indices[sparseDim], ValueRange{k});
-    ext->setAttr("DiscreteMemAccess", b.getUnitAttr());
-    Value sIdx = asIndex(b, loc, ext.getResult());
-
-    Value off;
-    SmallVector<OpFoldResult> sizes, strides, subOffs;
-    buildContiguousBlockGeometry(b, loc, vi, indices, sparseDim, sIdx, off,
-                                 sizes, strides, subOffs);
-    subOffs[sparseDim] = OpFoldResult(k);
-    SmallVector<OpFoldResult> subStr(vi.rank, b.getIndexAttr(1));
-    Value gm = b.create<memref::ReinterpretCastOp>(
-        loc, gmBlkTy, base, OpFoldResult(off), sizes, strides);
-    Value slice =
-        b.create<tensor::ExtractSliceOp>(loc, value, subOffs, sizes, subStr);
-    auto mat =
-        b.create<bufferization::MaterializeInDestinationOp>(loc, slice, gm);
-    mat->setAttr("writable", b.getUnitAttr());
+  // Remove unit dimensions only when constructing the copy windows.
+  SmallVector<unsigned> blockDims;
+  SmallVector<OpFoldResult> blockSizes, localOffsets;
+  for (auto [i, d] : llvm::enumerate(nonSparseDims)) {
+    if (vi.tile[d] == 1)
+      continue;
+    blockDims.push_back(d);
+    blockSizes.push_back(access.sizes[i]);
+    localOffsets.push_back(access.localOffsets[i]);
   }
-  loop->setAttr("ExtractedLoadOrStore", b.getUnitAttr());
+  // An all-unit dense tile still copies one element.
+  if (blockDims.empty()) {
+    blockDims.push_back(nonSparseDims.back());
+    blockSizes.push_back(access.sizes.back());
+    localOffsets.push_back(access.localOffsets.back());
+  }
+  if (boundary) {
+    Value firstSize = getValueOrCreateConstantIndexOp(b, loc, blockSizes.front());
+    Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+    // Select a transfer extent, not a data value. Padding is filled separately.
+    blockSizes.front() =
+        b.create<arith::SelectOp>(loc, access.hasElements, firstSize, zero)
+            .getResult();
+  }
+
+  Value gm = createGmTileView(b, loc, vi, access.gmOffset, blockDims);
+  Value local = localValue;
+  if (boundary) {
+    SmallVector<OpFoldResult> zeros(blockDims.size(), b.getIndexAttr(0));
+    SmallVector<OpFoldResult> strides(blockDims.size(), b.getIndexAttr(1));
+    gm = b.create<memref::SubViewOp>(loc, gm, zeros, blockSizes, strides);
+  }
+  if (vi.isGatherScatter() || boundary) {
+    SmallVector<OpFoldResult> offsets, sizes, strides;
+    if (vi.isGatherScatter()) {
+      unsigned transferDim = 0;
+      for (unsigned d = 0; d < vi.rank; ++d) {
+        if (llvm::is_contained(blockDims, d)) {
+          offsets.push_back(localOffsets[transferDim]);
+          sizes.push_back(blockSizes[transferDim++]);
+        } else {
+          offsets.push_back(sparseCoordinates[d]
+                                ? OpFoldResult(sparseCoordinates[d])
+                                : OpFoldResult(b.getIndexAttr(0)));
+          sizes.push_back(b.getIndexAttr(1));
+        }
+      }
+    } else {
+      offsets = localOffsets;
+      sizes = blockSizes;
+    }
+    strides.assign(sizes.size(), b.getIndexAttr(1));
+    SmallVector<int64_t> shape;
+    for (OpFoldResult size : blockSizes)
+      shape.push_back(getConstantIntValue(size).value_or(ShapedType::kDynamic));
+    if (store) {
+      auto localType = RankedTensorType::get(shape, vi.elementType);
+      local = b.create<tensor::ExtractSliceOp>(loc, localType, localValue,
+                                               offsets, sizes, strides);
+    } else {
+      auto localType =
+          cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+              shape, cast<MemRefType>(localValue.getType()), offsets, sizes,
+              strides));
+      // Preserve the allocation's layout so the backend can rewrite this window
+      // when placing the tile in a different local memory format.
+      local = b.create<memref::SubViewOp>(loc, localType, localValue, offsets,
+                                          sizes, strides);
+    }
+  }
+  if (store) {
+    // Keep the source slice in tensor form until bufferization. A store window
+    // must not be mistaken for padding metadata of an earlier load.
+    auto materialize =
+        b.create<bufferization::MaterializeInDestinationOp>(loc, local, gm);
+    materialize->setAttr("writable", b.getUnitAttr());
+  } else {
+    b.create<memref::CopyOp>(loc, gm, local);
+  }
 }
 
-/// Return whether a sparse access contains a regular contiguous block.
-static bool supportsContiguousBlockTransfer(const ViewData &vi,
-                                            unsigned sparseDim) {
-  return llvm::any_of(llvm::enumerate(vi.strideStatic), [&](auto entry) {
-    return entry.index() != sparseDim && entry.value() == 1;
+static void emitBlockLoad(OpBuilder &b, Location loc, const ViewData &vi,
+                          Value buffer, ValueRange indices,
+                          ArrayRef<unsigned> nonSparseDims,
+                          Value accessInBounds) {
+  Value padding = createPaddingConstant(b, loc, vi);
+  Value falseValue = b.create<arith::ConstantIntOp>(loc, 0, 1);
+  Value needsPadding = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                               accessInBounds, falseValue);
+  b.create<scf::IfOp>(loc, needsPadding,
+                      [&](OpBuilder &nested, Location nestedLoc) {
+                        nested.create<linalg::FillOp>(
+                            nestedLoc, ValueRange{padding}, ValueRange{buffer});
+                        nested.create<scf::YieldOp>(nestedLoc);
+                      });
+
+  // Both full and boundary tiles use one clipped copy. Its window offsets
+  // dominate the copy even if the backend folds padding into the load.
+  emitSparseCoordinateLoops(b, loc, vi, [&](ArrayRef<Value> coordinates) {
+    emitBlockCopy(b, loc, vi, buffer, indices, coordinates, nonSparseDims,
+                  /*boundary=*/true, /*store=*/false);
+  });
+}
+
+static void emitBlockStore(OpBuilder &b, Location loc, const ViewData &vi,
+                           Value value, ValueRange indices,
+                           ArrayRef<unsigned> nonSparseDims,
+                           bool boundary) {
+  Value physicalValue = value;
+  if (!vi.isGatherScatter()) {
+    SmallVector<int64_t> shape = getBlockShape(vi.tile);
+    if (shape.size() != vi.rank) {
+      auto type = RankedTensorType::get(shape, vi.elementType);
+      auto reassociation = getReassociationIndicesForCollapse(vi.tile, shape);
+      physicalValue = b.create<tensor::CollapseShapeOp>(loc, type, value,
+                                                        *reassociation);
+    }
+  }
+  emitSparseCoordinateLoops(b, loc, vi, [&](ArrayRef<Value> coordinates) {
+    emitBlockCopy(b, loc, vi, physicalValue, indices, coordinates, nonSparseDims,
+                  boundary, /*store=*/true);
   });
 }
 
@@ -549,37 +626,14 @@ static void emitDiscreteScatter(OpBuilder &b, Location loc, const ViewData &vi,
             nested, nestedLoc, base, access.physicalOffset, vi.elementType);
         Value empty = nested.create<tensor::EmptyOp>(
             nestedLoc, ArrayRef<int64_t>{1}, vi.elementType);
-        Value inserted = nested.create<tensor::InsertOp>(
-            nestedLoc, element, empty, ValueRange{c0});
+        Value inserted = nested.create<tensor::InsertOp>(nestedLoc, element,
+                                                         empty, ValueRange{c0});
         auto materialize =
             nested.create<bufferization::MaterializeInDestinationOp>(
                 nestedLoc, inserted, gmElement);
         materialize->setAttr("writable", nested.getUnitAttr());
         nested.create<scf::YieldOp>(nestedLoc);
       });
-}
-
-/// Select contiguous block transfer when possible, otherwise lower
-/// elementwise.
-static Value emitGatherAccess(OpBuilder &b, Location loc, const ViewData &vi,
-                              Value base, ValueRange indices,
-                              ArrayRef<int64_t> sparseDims,
-                              RankedTensorType resultType) {
-  if (sparseDims.size() == 1 &&
-      supportsContiguousBlockTransfer(vi, sparseDims[0]))
-    return emitContiguousGather(b, loc, vi, base, indices, sparseDims[0],
-                                resultType);
-  return emitDiscreteGather(b, loc, vi, base, indices, sparseDims, resultType);
-}
-
-static void emitScatterAccess(OpBuilder &b, Location loc, const ViewData &vi,
-                              Value base, Value value, ValueRange indices,
-                              ArrayRef<int64_t> sparseDims) {
-  if (sparseDims.size() == 1 &&
-      supportsContiguousBlockTransfer(vi, sparseDims[0]))
-    emitContiguousScatter(b, loc, vi, base, value, indices, sparseDims[0]);
-  else
-    emitDiscreteScatter(b, loc, vi, base, value, indices, sparseDims);
 }
 
 //===----------------------------------------------------------------------===//
@@ -606,53 +660,47 @@ static LogicalResult lowerViewLoad(tv::ViewLoadOp load,
     }
   }
 
-  std::optional<PhysicalTransferLayout> transferLayout;
-  if (!vi.isGatherScatter()) {
-    transferLayout = buildPhysicalTransferLayout(vi);
-    if (!transferLayout)
-      return failure();
-  }
+  SmallVector<unsigned> nonSparseDims = getNonSparseDims(vi);
+  bool blockAccess = canUseBlockAccess(vi, nonSparseDims);
+  if (!vi.isGatherScatter() && !blockAccess)
+    return failure();
 
   vi.base = materializeBase(b, loc, vi);
   Value accessInBounds =
       buildAccessInBoundsCondition(b, loc, vi, load.getIndices());
-  auto guardedLoad = b.create<scf::IfOp>(
-      loc, accessInBounds,
-      [&](OpBuilder &nested, Location nestedLoc) {
-        Value result;
-        if (vi.isGatherScatter()) {
-          result = emitGatherAccess(nested, nestedLoc, vi, vi.base,
-                                    load.getIndices(), vi.sparseDims, tensorTy);
-        } else {
-          bool collapsed = transferLayout->collapses(vi.rank);
-          auto localType = MemRefType::get(vi.tile, vi.elementType);
-          auto transferLocalType =
-              MemRefType::get(transferLayout->shape, vi.elementType);
-          Value buffer = nested.create<memref::AllocOp>(
-              nestedLoc, collapsed ? transferLocalType : localType);
-          Value offset =
-              buildTileOriginOffset(nested, nestedLoc, vi, load.getIndices());
-          Value gm =
-              createGmTileView(nested, nestedLoc, vi, offset, &*transferLayout);
-          nested.create<memref::CopyOp>(nestedLoc, gm, buffer);
+  if (!blockAccess) {
+    auto emitGather = [&](OpBuilder &nested, Location nestedLoc) {
+      Value result =
+          emitDiscreteGather(nested, nestedLoc, vi, vi.base, load.getIndices(),
+                             vi.sparseDims, tensorTy);
+      nested.create<scf::YieldOp>(nestedLoc, result);
+    };
+    auto guardedLoad =
+        b.create<scf::IfOp>(loc, accessInBounds, emitGather, emitGather);
+    rewriter.replaceOp(load, guardedLoad.getResults());
+    return success();
+  }
 
-          Value tensorBuffer = buffer;
-          if (collapsed)
-            tensorBuffer = nested.create<memref::ExpandShapeOp>(
-                nestedLoc, localType, buffer, transferLayout->reassociation);
-          result = nested.create<bufferization::ToTensorOp>(
-              nestedLoc, tensorTy, tensorBuffer,
-              /*restrict=*/true, /*writable=*/false);
-        }
-        nested.create<scf::YieldOp>(nestedLoc, result);
-      },
-      [&](OpBuilder &nested, Location nestedLoc) {
-        Value result =
-            emitDiscreteGather(nested, nestedLoc, vi, vi.base,
-                               load.getIndices(), vi.sparseDims, tensorTy);
-        nested.create<scf::YieldOp>(nestedLoc, result);
-      });
-  rewriter.replaceOp(load, guardedLoad.getResults());
+  SmallVector<int64_t> bufferShape =
+      vi.isGatherScatter() ? vi.tile : getBlockShape(vi.tile);
+  auto bufferType = MemRefType::get(bufferShape, vi.elementType);
+  Value buffer = b.create<memref::AllocOp>(loc, bufferType);
+  emitBlockLoad(b, loc, vi, buffer, load.getIndices(), nonSparseDims,
+                accessInBounds);
+
+  // Keep the tensor outside the if so backend layout inference can trace
+  // consumers back to the allocation.
+  Value tensorBuffer = buffer;
+  if (bufferShape.size() != vi.rank) {
+    auto logicalType = MemRefType::get(vi.tile, vi.elementType);
+    auto reassociation =
+        getReassociationIndicesForCollapse(vi.tile, bufferShape);
+    tensorBuffer = b.create<memref::ExpandShapeOp>(
+        loc, logicalType, buffer, *reassociation);
+  }
+  Value result = b.create<bufferization::ToTensorOp>(
+      loc, tensorTy, tensorBuffer, /*restrict=*/true, /*writable=*/false);
+  rewriter.replaceOp(load, result);
   return success();
 }
 
@@ -675,20 +723,31 @@ static LogicalResult lowerViewStore(tv::ViewStoreOp store,
     }
   }
 
+  SmallVector<unsigned> nonSparseDims = getNonSparseDims(vi);
+  bool blockAccess = canUseBlockAccess(vi, nonSparseDims);
+  if (!vi.isGatherScatter() && !blockAccess)
+    return failure();
+
   vi.base = materializeBase(b, loc, vi);
   Value accessInBounds =
       buildAccessInBoundsCondition(b, loc, vi, store.getIndices());
   b.create<scf::IfOp>(
       loc, accessInBounds,
       [&](OpBuilder &nested, Location nestedLoc) {
-        if (vi.isGatherScatter())
-          emitScatterAccess(nested, nestedLoc, vi, vi.base, store.getValue(),
-                            store.getIndices(), vi.sparseDims);
-        else {
+        if (vi.isGatherScatter()) {
+          if (blockAccess)
+            emitBlockStore(nested, nestedLoc, vi, store.getValue(),
+                           store.getIndices(), nonSparseDims,
+                           /*boundary=*/false);
+          else
+            emitDiscreteScatter(nested, nestedLoc, vi, vi.base,
+                                store.getValue(), store.getIndices(),
+                                vi.sparseDims);
+        } else {
           Value offset =
               buildTileOriginOffset(nested, nestedLoc, vi, store.getIndices());
-          Value gm = createGmTileView(nested, nestedLoc, vi, offset,
-                                      /*transferLayout=*/nullptr);
+          Value gm =
+              createGmTileView(nested, nestedLoc, vi, offset, nonSparseDims);
           auto materialize =
               nested.create<bufferization::MaterializeInDestinationOp>(
                   nestedLoc, store.getValue(), gm);
@@ -697,8 +756,13 @@ static LogicalResult lowerViewStore(tv::ViewStoreOp store,
         nested.create<scf::YieldOp>(nestedLoc);
       },
       [&](OpBuilder &nested, Location nestedLoc) {
-        emitDiscreteScatter(nested, nestedLoc, vi, vi.base, store.getValue(),
-                            store.getIndices(), vi.sparseDims);
+        if (blockAccess)
+          emitBlockStore(nested, nestedLoc, vi, store.getValue(),
+                         store.getIndices(), nonSparseDims,
+                         /*boundary=*/true);
+        else
+          emitDiscreteScatter(nested, nestedLoc, vi, vi.base, store.getValue(),
+                              store.getIndices(), vi.sparseDims);
         nested.create<scf::YieldOp>(nestedLoc);
       });
 

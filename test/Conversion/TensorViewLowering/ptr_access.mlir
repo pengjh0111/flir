@@ -31,7 +31,7 @@ module {
 
   // CHECK-LABEL: tt.func public @ptr_store(
   // CHECK-SAME: [[POINTERS:%.*]]: tensor<8x8x!tt.ptr<f32>>,
-  // CHECK-SAME: [[INDEX0:%.*]]: tensor<4xindex>,
+  // CHECK-SAME: [[INDEX0:%[^ ,]*]]: tensor<4xindex>,
   // CHECK-SAME: [[INDEX1:%.*]]: tensor<4xindex>,
   // CHECK-SAME: [[VALUE:%.*]]: tensor<4xf32>) {
   // CHECK-DAG: [[C0:%.*]] = arith.constant 0 : index
